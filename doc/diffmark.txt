@@ -1,0 +1,195 @@
+*diffmark.txt*   Review a diff without leaving the file        Last change: 2026
+
+==============================================================================
+CONTENTS                                                    *diffmark-contents*
+
+  1. Introduction ....................... |diffmark-introduction|
+  2. Requirements ....................... |diffmark-requirements|
+  3. Setup .............................. |diffmark-setup|
+  4. Modes .............................. |diffmark-modes|
+  5. Mappings ........................... |diffmark-mappings|
+  6. GitHub comments .................... |diffmark-github|
+  7. Notes .............................. |diffmark-notes|
+  8. Copying ............................ |diffmark-copy|
+  9. Undo ............................... |diffmark-undo|
+ 10. Commands ........................... |diffmark-commands|
+ 11. Highlights ......................... |diffmark-highlights|
+
+==============================================================================
+1. INTRODUCTION                                         *diffmark-introduction*
+
+diffmark paints whole changed lines instead of a thin gutter bar, draws the
+code that was removed where it used to be, pulls the PR's review comments into
+the buffer, and tracks what you have already read.
+
+Nothing runs until you ask for it: while disabled the plugin issues no git
+commands at all.
+
+==============================================================================
+2. REQUIREMENTS                                         *diffmark-requirements*
+
+  - Neovim 0.10+ (uses |vim.system()| and |nvim_buf_set_extmark()| virt_lines)
+  - git
+  - gh, logged in            optional, only for |diffmark-github|
+  - telescope.nvim           optional, for the fuzzy overview
+  - nvim-web-devicons        optional, icons in the overview
+
+==============================================================================
+3. SETUP                                                       *diffmark-setup*
+
+>lua
+    require("diffmark").setup({
+      mode      = "worktree",  -- "worktree" | "commit" | "branch"
+      enabled   = false,       -- true: marks on from the moment nvim starts
+      deletions = "all",       -- "all" | "cursor" | "off"
+      github    = true,        -- false: never shell out to gh
+    })
+<
+`deletions` is what opening a diff resets to, not just the initial value.
+Hiding removed code with |<leader>hD| is treated as a momentary "get out of my
+way", so it survives neither a restart nor the next <leader>hh.
+
+==============================================================================
+4. MODES                                                       *diffmark-modes*
+
+<leader>hh asks which diff you want:
+
+  PR diff        merge-base with the default branch. The whole branch:
+                 committed work and uncommitted edits together.
+  Latest commit  HEAD~1. Your last commit plus anything dirty on top.
+  Uncommitted    HEAD. Only what you have not committed.
+
+The default branch comes from `git symbolic-ref refs/remotes/origin/HEAD`, so
+repos on develop/trunk work without configuration. On the default branch itself
+the merge-base is HEAD, so PR mode has nothing to show; diffmark says so once
+rather than rendering an empty diff.
+
+==============================================================================
+5. MAPPINGS                                                 *diffmark-mappings*
+
+<leader>h? lists all of these inside nvim.
+
+diff ~
+  <leader>hh    on (asks which diff) / off
+  <leader>hD    hide / show removed code
+  <leader>hO    overview of every changed file, note and comment
+  ]h  [h        next / previous hunk, deletions included
+  <leader>hs    legend and counts
+  <leader>hr    reload after commit / rebase / outside staging
+  <leader>hU    undo the last diffmark action
+  <leader>h?    help
+
+stage ~
+  <leader>hS    stage the hunk under the cursor (visual: the selection)
+  <leader>hA    stage the whole file
+  <leader>hu    unstage the whole file
+
+viewed ~
+  <leader>hv    tick off the hunk under the cursor (visual: the selection)
+  <leader>hV    clear in this file
+  <leader>hZ    clear in the whole repo
+
+github ~
+  <leader>hg    PR comments off / on
+  <leader>hG    open / close the comments panel
+  <leader>hC    comment bodies: off / under cursor / all
+
+notes ~
+  <leader>hc    add / edit a note on this line (empty input deletes)
+  <leader>hd    delete the note on this line
+  <leader>hl    list every note (quickfix)
+  <leader>ho    open .comments.txt
+  <leader>hX    delete all notes
+
+copy ~
+  <leader>hy    copy removed code / PR comments / notes
+
+In either panel: <CR> jumps to the line, y copies the entry, Y copies the whole
+panel, q closes.
+
+Viewed marks are keyed on the hash of the line's text, not its number, so they
+follow the line as you edit above it and un-tick themselves the moment the line
+itself changes.
+
+==============================================================================
+6. GITHUB COMMENTS                                            *diffmark-github*
+
+Review comments are fetched automatically the first time you open a diff in a
+repo: one `gh` call per repo per session, asynchronous, with a spinner in the
+bottom-right corner. It never opens a split under you and a repo with no PR is
+silent rather than an error. <leader>hg turns them off, and on again (which
+refetches rather than restoring a stale list).
+
+Comments ride on extmarks, so they drift with your edits. A comment whose line
+has since changed comes back from the API without a line number; it is kept and
+marked outdated rather than dropped.
+
+`:DiffMark ghsync` refetches now and opens the panel. The Lua API also takes an
+explicit PR number, for reviewing a PR that is not your current branch:
+>lua
+    require("diffmark").gh_sync(412)
+<
+==============================================================================
+7. NOTES                                                       *diffmark-notes*
+
+Notes live in <repo>/.comments.txt as `path:line: text` — the shape an agent
+can read back. They follow the line while you edit, and the file is rewritten
+with fresh line numbers on every save.
+
+Two nvim instances in one repo do not clobber each other: every write is
+authoritative only for the paths it owns and re-reads the rest from disk first.
+
+==============================================================================
+8. COPYING                                                      *diffmark-copy*
+
+Removed code is drawn with virt_lines and comments with virt_text. Neither is
+buffer text, so `y` cannot reach them. <leader>hy offers whatever applies where
+the cursor is: the removed block under it, every removed block in the file, the
+comment on this line, the comments in this file, every comment on the PR, or
+the notes file. With one option it copies without asking.
+
+A single block copies as bare code, ready to paste back. A whole file gets
+`@@ path:line @@` headers so you can tell where each piece came from. Text goes
+to both "+ and the unnamed register.
+
+==============================================================================
+9. UNDO                                                         *diffmark-undo*
+
+|u| cannot reach any of this, because none of it is buffer text. <leader>hU
+steps back through the diffmark actions that touched the git index,
+.comments.txt or the viewed store: staging, unstaging, viewed ticks, notes.
+
+Index undo snapshots `git ls-files --stage` before the change and restores it
+with `git update-index`, including the "was not in the index at all" state.
+
+==============================================================================
+10. COMMANDS                                                *diffmark-commands*
+
+`:DiffMark {action}`, with completion:
+>
+    toggle pick undo yank yanknotes overview overviewsplit
+    gh ghsync ghpanel ghclear
+    comments commentsoff commentscursor commentsall
+    worktree commit branch reload refresh status legend help notes
+    deletions deloff delcursor delall
+    stage stagefile unstage viewed clearviewed clearviewedall
+<
+==============================================================================
+11. HIGHLIGHTS                                            *diffmark-highlights*
+
+Shape carries add/change/delete and colour carries staged/viewed, so neither
+channel has to do both jobs and the result survives colourblindness.
+
+    DiffMarkAdd       ┃  added, not staged
+    DiffMarkChange    ╏  changed, not staged
+    DiffMarkDelete    ▁  removed here
+    DiffMarkStaged       in the index: staged, or committed on this branch
+    DiffMarkViewed    ✓  ticked off
+    DiffMarkNote      󰆉  a note is attached
+    DiffMarkGh        󰊤  a PR review comment is attached
+
+Each also has a `…Ln` variant used for the line background, and a `…Virt`
+variant for glyphs drawn inside a painted virtual line. Override them like any
+other highlight group.
+
+vim:tw=78:ts=8:ft=help:norl:
