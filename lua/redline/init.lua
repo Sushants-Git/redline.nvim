@@ -1,4 +1,4 @@
--- diffmark: gitsigns, but the whole line gets painted (like <leader>mm marks a
+-- redline: gitsigns, but the whole line gets painted (like <leader>mm marks a
 -- bookmark) instead of a thin bar in the gutter.
 --
 -- Two diff modes, toggled at runtime:
@@ -25,22 +25,22 @@ local uv = vim.uv or vim.loop
 
 local M = {}
 
-local ns_diff = api.nvim_create_namespace("diffmark")
-local ns_note = api.nvim_create_namespace("diffmark_notes")
+local ns_diff = api.nvim_create_namespace("redline")
+local ns_note = api.nvim_create_namespace("redline_notes")
 -- deleted code lives in its own namespace so it can be redrawn on cursor
 -- movement without recomputing the diff
-local ns_del = api.nvim_create_namespace("diffmark_deleted")
+local ns_del = api.nvim_create_namespace("redline_deleted")
 -- review comments pulled from the PR: separate from your own notes so a
 -- refetch never has to touch .comments.txt
-local ns_gh = api.nvim_create_namespace("diffmark_github")
+local ns_gh = api.nvim_create_namespace("redline_github")
 -- the expanded comment body, in its own namespace for the same reason the
 -- deleted code is: it is redrawn on cursor movement, the signs are not
-local ns_ghx = api.nvim_create_namespace("diffmark_github_body")
+local ns_ghx = api.nvim_create_namespace("redline_github_body")
 
 local NOTES_FILE = ".comments.txt"
 local NOTES_HEADER = {
     "# temp notes for the agent -- format: path:line: note",
-    "# written by nvim diffmark; line numbers are kept in sync on save",
+    "# written by nvim redline; line numbers are kept in sync on save",
 }
 
 local state = {
@@ -109,9 +109,9 @@ local palette = {
     },
 }
 
--- add -> DiffMarkAdd / DiffMarkAddLn
+-- add -> RedlineAdd / RedlineAddLn
 local function hl_name(kind)
-    return "DiffMark" .. kind:gsub("^%l", string.upper)
+    return "Redline" .. kind:gsub("^%l", string.upper)
 end
 
 local function apply_highlights()
@@ -171,7 +171,7 @@ local function get_root(bufnr)
     return root
 end
 
--- The panels are nofile buffers ("diffmark://overview"), so get_root cannot
+-- The panels are nofile buffers ("redline://overview"), so get_root cannot
 -- find a repo from them -- which meant opening one panel while standing in
 -- another silently did nothing. Fall back to the cwd.
 local function current_root()
@@ -193,7 +193,7 @@ end
 -- undo
 -- ─────────────────────────────
 
--- Every diffmark action that touches something outside the buffer (the git
+-- Every redline action that touches something outside the buffer (the git
 -- index, .comments.txt, the viewed store) pushes the inverse of itself here.
 -- `u` cannot reach any of it -- these are not buffer edits -- so without this
 -- a mis-aimed <leader>hS or <leader>hZ is simply gone.
@@ -272,7 +272,7 @@ local function base_rev(root)
             if out and vim.trim(out) ~= "" then rev = vim.trim(out) end
         end
         if not rev then
-            vim.notify("diffmark: no default branch to diff against -- showing uncommitted instead",
+            vim.notify("redline: no default branch to diff against -- showing uncommitted instead",
                 vim.log.levels.WARN)
             rev = "HEAD"
         else
@@ -281,7 +281,7 @@ local function base_rev(root)
             local head = git(root, { "rev-parse", "HEAD" })
             if head and vim.trim(head) == rev and not state.warned_on_base[root] then
                 state.warned_on_base[root] = true
-                vim.notify(("diffmark: you are on %s -- branch mode shows only uncommitted work here")
+                vim.notify(("redline: you are on %s -- branch mode shows only uncommitted work here")
                     :format(ref), vim.log.levels.WARN)
             end
         end
@@ -331,7 +331,7 @@ end
 -- ─────────────────────────────
 
 local function viewed_path()
-    return vim.fn.stdpath("data") .. "/diffmark-viewed.json"
+    return vim.fn.stdpath("data") .. "/redline-viewed.json"
 end
 
 local function load_viewed()
@@ -406,8 +406,8 @@ local function render_deletions(bufnr)
             local virt = {}
             for i, text in ipairs(expanded) do
                 virt[i] = {
-                    { GLYPH.delete .. " ", "DiffMarkDeleteVirt" },
-                    { text .. string.rep(" ", width - vim.fn.strdisplaywidth(text) + 1), "DiffMarkDeleteLn" },
+                    { GLYPH.delete .. " ", "RedlineDeleteVirt" },
+                    { text .. string.rep(" ", width - vim.fn.strdisplaywidth(text) + 1), "RedlineDeleteLn" },
                 }
             end
             pcall(api.nvim_buf_set_extmark, bufnr, ns_del, b.row, 0, {
@@ -623,7 +623,7 @@ local function write_notes(root, owned)
     end
     local fd = io.open(path, "w")
     if not fd then
-        vim.notify("diffmark: cannot write " .. path, vim.log.levels.ERROR)
+        vim.notify("redline: cannot write " .. path, vim.log.levels.ERROR)
         return
     end
     fd:write(table.concat(lines, "\n"), "\n")
@@ -649,9 +649,9 @@ local function render_notes(bufnr)
         if lnum >= 1 and lnum <= total then
             local ok, id = pcall(api.nvim_buf_set_extmark, bufnr, ns_note, lnum - 1, 0, {
                 sign_text = "󰆉",
-                sign_hl_group = "DiffMarkNote",
-                line_hl_group = "DiffMarkNoteLn",
-                virt_text = { { "  " .. text, "DiffMarkNote" } },
+                sign_hl_group = "RedlineNote",
+                line_hl_group = "RedlineNoteLn",
+                virt_text = { { "  " .. text, "RedlineNote" } },
                 virt_text_pos = "eol",
                 priority = 9,
             })
@@ -724,7 +724,7 @@ local function spin_draw()
     if not (spin.buf and api.nvim_buf_is_valid(spin.buf)) then return end
     local line = " " .. spin.frames[spin.i] .. " " .. spin.text .. " "
     api.nvim_buf_set_lines(spin.buf, 0, -1, false, { line })
-    api.nvim_buf_add_highlight(spin.buf, -1, "DiffMarkGh", 0, 0, -1)
+    api.nvim_buf_add_highlight(spin.buf, -1, "RedlineGh", 0, 0, -1)
     if spin.win and api.nvim_win_is_valid(spin.win) then
         api.nvim_win_set_config(spin.win, {
             relative = "editor",
@@ -754,7 +754,7 @@ local function spin_start(text)
         focusable = false,
         zindex = 200,
     })
-    vim.wo[spin.win].winhl = "Normal:DiffMarkGhLn"
+    vim.wo[spin.win].winhl = "Normal:RedlineGhLn"
     spin_draw()
     spin.timer = uv.new_timer()
     spin.timer:start(80, 80, vim.schedule_wrap(function()
@@ -785,8 +785,8 @@ local function render_gh(bufnr)
             if #head > 60 then head = head:sub(1, 59) .. "…" end
             local ok, id = pcall(api.nvim_buf_set_extmark, bufnr, ns_gh, item.line - 1, 0, {
                 sign_text = GLYPH.gh,
-                sign_hl_group = "DiffMarkGh",
-                virt_text = { { "  @" .. item.author .. ": " .. head, "DiffMarkGh" } },
+                sign_hl_group = "RedlineGh",
+                virt_text = { { "  @" .. item.author .. ": " .. head, "RedlineGh" } },
                 virt_text_pos = "eol",
                 priority = 8,
             })
@@ -854,8 +854,8 @@ function render_gh_body(bufnr)
             local virt = {}
             for i, text in ipairs(rows) do
                 virt[i] = {
-                    { i == 1 and (GLYPH.gh .. " ") or "   ", "DiffMarkGhVirt" },
-                    { text .. string.rep(" ", w - vim.fn.strdisplaywidth(text) + 1), "DiffMarkGhLn" },
+                    { i == 1 and (GLYPH.gh .. " ") or "   ", "RedlineGhVirt" },
+                    { text .. string.rep(" ", w - vim.fn.strdisplaywidth(text) + 1), "RedlineGhLn" },
                 }
             end
             pcall(api.nvim_buf_set_extmark, bufnr, ns_ghx, pos[1], 0, {
@@ -951,10 +951,10 @@ local function panel_open(P, render, root, focus)
     end
     local from = api.nvim_get_current_win()
     P.buf = api.nvim_create_buf(false, true)
-    api.nvim_buf_set_name(P.buf, "diffmark://" .. P.name)
+    api.nvim_buf_set_name(P.buf, "redline://" .. P.name)
     vim.bo[P.buf].buftype = "nofile"
     vim.bo[P.buf].bufhidden = "wipe"
-    vim.bo[P.buf].filetype = "diffmark-" .. P.name
+    vim.bo[P.buf].filetype = "redline-" .. P.name
 
     vim.cmd("vsplit")
     P.win = api.nvim_get_current_win()
@@ -985,7 +985,7 @@ local function gh_render(P, root)
         lines = { " no comments fetched yet", "", " <leader>hg to sync" }
     else
         lines[#lines + 1] = string.format(" %s PR #%d  %s", GLYPH.gh, data.pr, data.title or "")
-        hls[#lines] = "DiffMarkGh"
+        hls[#lines] = "RedlineGh"
         lines[#lines + 1] = ""
 
         local by_file, order = {}, {}
@@ -1128,12 +1128,12 @@ local function overview_render(P, root)
     local lines, targets, hls = {}, {}, {}
     local files, order = overview_data(root)
 
-    lines[#lines + 1] = " diffmark  ·  " .. (MODE_LABEL[state.mode] or state.mode)
+    lines[#lines + 1] = " redline  ·  " .. (MODE_LABEL[state.mode] or state.mode)
     hls[#lines] = "Title"
     local gh = state.gh[root]
     if gh then
         lines[#lines + 1] = string.format(" %s PR #%d  %s", GLYPH.gh, gh.pr, gh.title or "")
-        hls[#lines] = "DiffMarkGh"
+        hls[#lines] = "RedlineGh"
     end
     lines[#lines + 1] = ""
 
@@ -1158,7 +1158,7 @@ local function overview_render(P, root)
     for _, rel in ipairs(order) do
         local f = files[rel]
         lines[#lines + 1] = " " .. rel
-        hls[#lines] = f.staged and "DiffMarkStaged" or "Directory"
+        hls[#lines] = f.staged and "RedlineStaged" or "Directory"
         targets[#lines] = { file = root .. "/" .. rel, line = f.first or 1 }
 
         local bits = {}
@@ -1187,7 +1187,7 @@ local function overview_render(P, root)
                     if #body > 34 then body = body:sub(1, 33) .. "…" end
                     lines[#lines + 1] = string.format("   %s %s @%s  %s", GLYPH.gh,
                         item.line and (item.line .. "") or "—", item.author, body)
-                    hls[#lines] = "DiffMarkGh"
+                    hls[#lines] = "RedlineGh"
                     targets[#lines] = { file = root .. "/" .. rel, line = item.line or 1 }
                 end
             end
@@ -1196,7 +1196,7 @@ local function overview_render(P, root)
             local short = text:gsub("%s+", " ")
             if #short > 34 then short = short:sub(1, 33) .. "…" end
             lines[#lines + 1] = string.format("   󰆉 %d  %s", lnum, short)
-            hls[#lines] = "DiffMarkNote"
+            hls[#lines] = "RedlineNote"
             targets[#lines] = { file = root .. "/" .. rel, line = lnum }
         end
         lines[#lines + 1] = ""
@@ -1213,7 +1213,7 @@ function M.overview_split()
     end
     local root = current_root()
     if not root then
-        vim.notify("diffmark: not inside a git repository", vim.log.levels.WARN)
+        vim.notify("redline: not inside a git repository", vim.log.levels.WARN)
         return
     end
     ensure_enabled()
@@ -1275,12 +1275,12 @@ end
 -- selected row actually asks: a file row previews its diff, a comment row
 -- previews the comment and the code it hangs off, a note row previews the note
 -- against the lines around it. <CR> goes to the line in every case.
-local ns_prev = api.nvim_create_namespace("diffmark_preview")
+local ns_prev = api.nvim_create_namespace("redline_preview")
 
 local function hunk_hl(line)
-    if line:match("^@@") then return "DiffMarkChange" end
-    if line:match("^%+") then return "DiffMarkAdd" end
-    if line:match("^%-") then return "DiffMarkDelete" end
+    if line:match("^@@") then return "RedlineChange" end
+    if line:match("^%+") then return "RedlineAdd" end
+    if line:match("^%-") then return "RedlineDelete" end
     return nil
 end
 
@@ -1291,7 +1291,7 @@ local function preview_comment(e, root, width)
 
     lines[#lines + 1] = string.format("%s %s  ·  %s:%s", glyph, who, e.rel,
         e.outdated and "outdated" or e.line)
-    hls[#lines] = e.kind == "note" and "DiffMarkNote" or "DiffMarkGh"
+    hls[#lines] = e.kind == "note" and "RedlineNote" or "RedlineGh"
     lines[#lines + 1] = string.rep("─", math.min(width, 78))
     hls[#lines] = "Comment"
 
@@ -1315,7 +1315,7 @@ local function preview_comment(e, root, width)
             local all = vim.fn.readfile(path)
             for i = math.max(1, e.line - 6), math.min(#all, e.line + 6) do
                 lines[#lines + 1] = string.format("%5d  %s", i, all[i])
-                if i == e.line then hls[#lines] = "DiffMarkChangeLn" end
+                if i == e.line then hls[#lines] = "RedlineChangeLn" end
             end
         end
     end
@@ -1342,7 +1342,7 @@ end
 local function overview_previewer(root)
     local previewers = require("telescope.previewers")
     return previewers.new_buffer_previewer({
-        title = "diffmark preview",
+        title = "redline preview",
         dyn_title = function(_, entry)
             local e = entry.value
             if e.kind == "file" then return e.rel .. "  (diff)" end
@@ -1388,14 +1388,14 @@ function M.overview()
 
     local root = current_root()
     if not root then
-        vim.notify("diffmark: not inside a git repository", vim.log.levels.WARN)
+        vim.notify("redline: not inside a git repository", vim.log.levels.WARN)
         return
     end
     ensure_enabled()
 
     local entries = overview_entries(root)
     if #entries == 0 then
-        vim.notify("diffmark: nothing changed against this base")
+        vim.notify("redline: nothing changed against this base")
         return
     end
 
@@ -1420,14 +1420,14 @@ function M.overview()
             display = function()
                 return displayer({
                     { icon or "", icon_hl },
-                    { e.rel, e.f.staged and "DiffMarkStaged" or "Directory" },
+                    { e.rel, e.f.staged and "RedlineStaged" or "Directory" },
                     { file_stats(e.f), "Comment" },
                 })
             end
         else
             local is_note = e.kind == "note"
             local glyph = is_note and "󰆉" or GLYPH.gh
-            local hl = is_note and "DiffMarkNote" or "DiffMarkGh"
+            local hl = is_note and "RedlineNote" or "RedlineGh"
             local label = is_note
                 and string.format("  %d", e.line)
                 or string.format("  %s  @%s", e.outdated and "—" or e.line, e.author)
@@ -1448,7 +1448,7 @@ function M.overview()
     end
 
     local gh = state.gh[root]
-    local title = "diffmark  ·  " .. (MODE_LABEL[state.mode] or state.mode)
+    local title = "redline  ·  " .. (MODE_LABEL[state.mode] or state.mode)
     if gh then title = title .. string.format("  ·  %s #%d", GLYPH.gh, gh.pr) end
 
     pickers.new({
@@ -1483,13 +1483,13 @@ function M.gh_sync(number, opts)
     local root = current_root()
     if not root then
         if not opts.quiet then
-            vim.notify("diffmark: not inside a git repository", vim.log.levels.WARN)
+            vim.notify("redline: not inside a git repository", vim.log.levels.WARN)
         end
         return
     end
     if vim.fn.executable("gh") == 0 then
         if not opts.quiet then
-            vim.notify("diffmark: gh CLI not found -- install it to fetch PR comments",
+            vim.notify("redline: gh CLI not found -- install it to fetch PR comments",
                 vim.log.levels.ERROR)
         end
         return
@@ -1519,7 +1519,7 @@ function M.gh_sync(number, opts)
             { cwd = root, text = true },
             function(res)
                 if res.code ~= 0 then
-                    return fail("diffmark: fetching comments failed\n" .. (res.stderr or ""),
+                    return fail("redline: fetching comments failed\n" .. (res.stderr or ""),
                         vim.log.levels.ERROR)
                 end
                 vim.schedule(function()
@@ -1560,12 +1560,12 @@ function M.gh_sync(number, opts)
     vim.system({ "gh", "pr", "view", "--json", "number,title" }, { cwd = root, text = true },
         function(pr_res)
             if pr_res.code ~= 0 then
-                return fail("diffmark: no PR for this branch\n" .. (pr_res.stderr or ""),
+                return fail("redline: no PR for this branch\n" .. (pr_res.stderr or ""),
                     vim.log.levels.WARN)
             end
             local ok, pr = pcall(vim.json.decode, pr_res.stdout)
             if not ok or not pr.number then
-                return fail("diffmark: could not read PR number", vim.log.levels.ERROR)
+                return fail("redline: could not read PR number", vim.log.levels.ERROR)
             end
             fetch(pr)
         end)
@@ -1590,7 +1590,7 @@ local COMMENT_LABEL = {
 
 function M.set_comments(mode)
     if not COMMENT_LABEL[mode] then
-        vim.notify("diffmark: comments must be off / cursor / all", vim.log.levels.ERROR)
+        vim.notify("redline: comments must be off / cursor / all", vim.log.levels.ERROR)
         return
     end
     state.show_comments = mode
@@ -1743,30 +1743,30 @@ function M.legend(status)
 
     local head = {}
     if status then
-        head[#head + 1] = { "diffmark: " .. status, "Title" }
+        head[#head + 1] = { "redline: " .. status, "Title" }
         head[#head + 1] = { "  " }
     else
-        head[#head + 1] = { "diffmark ", "Title" }
+        head[#head + 1] = { "redline ", "Title" }
     end
     head[#head + 1] = { state.enabled and MODE_LABEL[state.mode] or "off", "Special" }
     -- "all" is the norm now, so saying so every time is noise. Only call out the
     -- states that are not what you would assume from looking at the buffer.
     if state.enabled and state.show_deleted == "off" then
-        head[#head + 1] = { "  removed code hidden", "DiffMarkDelete" }
+        head[#head + 1] = { "  removed code hidden", "RedlineDelete" }
     elseif state.enabled and state.show_deleted == "cursor" then
-        head[#head + 1] = { "  removed code: cursor only", "DiffMarkDelete" }
+        head[#head + 1] = { "  removed code: cursor only", "RedlineDelete" }
     end
 
     local swatches = {
         { "  " },
-        { GLYPH.add .. " added ", "DiffMarkAdd" },
-        { GLYPH.change .. " changed ", "DiffMarkChange" },
-        { GLYPH.delete .. " removed ", "DiffMarkDelete" },
+        { GLYPH.add .. " added ", "RedlineAdd" },
+        { GLYPH.change .. " changed ", "RedlineChange" },
+        { GLYPH.delete .. " removed ", "RedlineDelete" },
         -- in branch mode the muted colour also covers work you already
         -- committed on this branch -- both are "not a live edit"
-        { GLYPH.add .. (state.mode == "worktree" and " staged " or " staged/committed "), "DiffMarkStaged" },
-        { GLYPH.viewed .. " viewed ", "DiffMarkViewed" },
-        { "󰆉 note", "DiffMarkNote" },
+        { GLYPH.add .. (state.mode == "worktree" and " staged " or " staged/committed "), "RedlineStaged" },
+        { GLYPH.viewed .. " viewed ", "RedlineViewed" },
+        { "󰆉 note", "RedlineNote" },
     }
     local tail = {
         { string.format("  ·  %d changed, %d staged, %d viewed", c.changed, c.staged, c.viewed), "Comment" },
@@ -1808,7 +1808,7 @@ local HELP = {
     { "<leader>hO", "overview: telescope popup of every changed file, note and PR comment" },
     { "", "type to filter across paths, authors and comment text; preview on the right" },
     { "<leader>hD", "hide / show removed code (it is on whenever you open a diff)" },
-    { "<leader>hU", "undo the last diffmark action (stage / viewed / note -- not buffer edits)" },
+    { "<leader>hU", "undo the last redline action (stage / viewed / note -- not buffer edits)" },
     false,
     "stage",
     { "<leader>hS", "stage the hunk under the cursor (visual: every hunk selected)" },
@@ -1833,8 +1833,8 @@ local HELP = {
     { "<leader>hG", "open / close the comments panel on the right" },
     { "", "in the panel: <CR> jumps, y copies the entry, Y copies all, q closes" },
     { "<leader>hC", "comment bodies: off -> under cursor -> all (starts at 'cursor')" },
-    { ":DiffMark ghsync", "refetch now, and open the panel" },
-    { ":DiffMark commentsoff", "hide every comment body, keep the 󰊤 signs" },
+    { ":Redline ghsync", "refetch now, and open the panel" },
+    { ":Redline commentsoff", "hide every comment body, keep the 󰊤 signs" },
     false,
     "colors",
     { "GREEN", "┃  line added, not staged yet" },
@@ -1846,7 +1846,7 @@ local HELP = {
     { "TEAL", "󰊤  a PR review comment is attached to this line" },
     false,
     "commands",
-    { ":DiffMark", "toggle pick worktree commit branch reload refresh status legend help" },
+    { ":Redline", "toggle pick worktree commit branch reload refresh status legend help" },
     { "", "deletions deloff delcursor delall notes stage stagefile unstage" },
     { "", "undo gh ghsync ghpanel ghclear" },
     { "", "comments commentsoff commentscursor commentsall" },
@@ -1855,12 +1855,12 @@ local HELP = {
 
 -- the colour rows paint their key cell instead of printing its name
 local SWATCH = {
-    GREEN = "DiffMarkAddLn",
-    BLUE = "DiffMarkChangeLn",
-    RED = "DiffMarkDeleteLn",
-    AMBER = "DiffMarkStagedLn",
-    GREY = "DiffMarkViewedLn",
-    PURPLE = "DiffMarkNoteLn",
+    GREEN = "RedlineAddLn",
+    BLUE = "RedlineChangeLn",
+    RED = "RedlineDeleteLn",
+    AMBER = "RedlineStagedLn",
+    GREY = "RedlineViewedLn",
+    PURPLE = "RedlineNoteLn",
 }
 
 function M.help()
@@ -1879,7 +1879,7 @@ function M.help()
         end
     end
 
-    push("  diffmark -- " .. MODE_LABEL[state.mode], "Title")
+    push("  redline -- " .. MODE_LABEL[state.mode], "Title")
     push("")
 
     for _, row in ipairs(HELP) do
@@ -1893,7 +1893,7 @@ function M.help()
             local text = string.format("    %s%s   %s", key, pad, row[2])
             push(text, "Comment", 4 + #key + #pad + 3, #text)
             -- the colour rows show the actual highlight in place of a key name
-            marks[#marks + 1] = { #lines - 1, 4, 4 + #key, SWATCH[key] or "DiffMarkNote" }
+            marks[#marks + 1] = { #lines - 1, 4, 4 + #key, SWATCH[key] or "RedlineNote" }
         end
     end
     push("")
@@ -1907,7 +1907,7 @@ function M.help()
     local buf = api.nvim_create_buf(false, true)
     api.nvim_buf_set_lines(buf, 0, -1, false, lines)
 
-    local ns_help = api.nvim_create_namespace("diffmark_help")
+    local ns_help = api.nvim_create_namespace("redline_help")
     for _, m in ipairs(marks) do
         pcall(api.nvim_buf_set_extmark, buf, ns_help, m[1], m[2], { end_col = m[3], hl_group = m[4] })
     end
@@ -1924,7 +1924,7 @@ function M.help()
         col = math.floor((vim.o.columns - width) / 2),
         style = "minimal",
         border = "rounded",
-        title = " diffmark ",
+        title = " redline ",
         title_pos = "center",
     })
     vim.wo[win].cursorline = false
@@ -1981,7 +1981,7 @@ function M.stage(first, last)
     local bufnr = api.nvim_get_current_buf()
     local root = get_root(bufnr)
     if not root then
-        vim.notify("diffmark: not in a git repo", vim.log.levels.WARN)
+        vim.notify("redline: not in a git repo", vim.log.levels.WARN)
         return
     end
     local rel = relpath(root, bufnr)
@@ -2005,7 +2005,7 @@ function M.stage(first, last)
     if not tracked then
         if vim.bo[bufnr].modified then vim.cmd("silent write") end
         if git(root, { "add", "--", rel }) == nil then
-            vim.notify("diffmark: git add failed", vim.log.levels.ERROR)
+            vim.notify("redline: git add failed", vim.log.levels.ERROR)
             return
         end
     else
@@ -2018,7 +2018,7 @@ function M.stage(first, last)
             { "git", "-C", root, "apply", "--cached", "--unidiff-zero", "--whitespace=nowarn", "-" },
             { stdin = patch, text = true }):wait()
         if res.code ~= 0 then
-            vim.notify("diffmark: staging failed\n" .. (res.stderr or ""), vim.log.levels.ERROR)
+            vim.notify("redline: staging failed\n" .. (res.stderr or ""), vim.log.levels.ERROR)
             return
         end
     end
@@ -2045,7 +2045,7 @@ function M.stage_file()
 
     local snap = index_entry(root, rel)
     if git(root, { "add", "--", rel }) == nil then
-        vim.notify("diffmark: git add failed", vim.log.levels.ERROR)
+        vim.notify("redline: git add failed", vim.log.levels.ERROR)
         return
     end
     push_undo("stage " .. rel, function()
@@ -2070,7 +2070,7 @@ function M.unstage_file()
 
     local snap = index_entry(root, rel)
     if git(root, { "restore", "--staged", "--", rel }) == nil then
-        vim.notify("diffmark: unstage failed", vim.log.levels.ERROR)
+        vim.notify("redline: unstage failed", vim.log.levels.ERROR)
         return
     end
     push_undo("unstage " .. rel, function()
@@ -2191,11 +2191,11 @@ local PICK = {
 
 function M.pick()
     if not get_root(api.nvim_get_current_buf()) then
-        vim.notify("diffmark: not inside a git repository", vim.log.levels.WARN)
+        vim.notify("redline: not inside a git repository", vim.log.levels.WARN)
         return
     end
     vim.ui.select(PICK, {
-        prompt = "diffmark: what do you want to see?",
+        prompt = "redline: what do you want to see?",
         format_item = function(item) return item.label end,
     }, function(choice)
         if not choice then return end
@@ -2223,7 +2223,7 @@ end
 
 function M.set_mode(mode)
     if not MODE_LABEL[mode] then
-        vim.notify("diffmark: mode must be 'worktree', 'commit' or 'branch'", vim.log.levels.ERROR)
+        vim.notify("redline: mode must be 'worktree', 'commit' or 'branch'", vim.log.levels.ERROR)
         return
     end
     state.mode = mode
@@ -2241,7 +2241,7 @@ local DEL_LABEL = {
 
 function M.set_deleted(mode)
     if not DEL_LABEL[mode] then
-        vim.notify("diffmark: deletions must be off / cursor / all", vim.log.levels.ERROR)
+        vim.notify("redline: deletions must be off / cursor / all", vim.log.levels.ERROR)
         return
     end
     ensure_enabled()
@@ -2269,10 +2269,10 @@ function M.toggle_deleted()
     M.set_deleted(state.deletions_default ~= "off" and state.deletions_default or "all")
 end
 
--- kept for :DiffMark deletions, which used to cycle
+-- kept for :Redline deletions, which used to cycle
 M.cycle_deleted = M.toggle_deleted
 
--- Step back through the diffmark actions that touched the index, the viewed
+-- Step back through the redline actions that touched the index, the viewed
 -- store or .comments.txt. Buffer text is not in here -- that is what `u` is for.
 function M.undo()
     local entry = table.remove(state.undo)
@@ -2282,7 +2282,7 @@ function M.undo()
     end
     local ok, err = pcall(entry.fn)
     if not ok then
-        vim.notify("diffmark: undo failed -- " .. tostring(err), vim.log.levels.ERROR)
+        vim.notify("redline: undo failed -- " .. tostring(err), vim.log.levels.ERROR)
         return
     end
     M.legend("undid " .. entry.desc)
@@ -2369,7 +2369,7 @@ function M.add_note()
     local bufnr = api.nvim_get_current_buf()
     local root = get_root(bufnr)
     if not root then
-        vim.notify("diffmark: not in a git repo", vim.log.levels.WARN)
+        vim.notify("redline: not in a git repo", vim.log.levels.WARN)
         return
     end
     local rel = relpath(root, bufnr)
@@ -2443,14 +2443,14 @@ function M.list_notes()
         end
     end
     if #items == 0 then
-        vim.notify("diffmark: no notes")
+        vim.notify("redline: no notes")
         return
     end
     table.sort(items, function(a, b)
         if a.filename == b.filename then return a.lnum < b.lnum end
         return a.filename < b.filename
     end)
-    vim.fn.setqflist({}, " ", { title = "diffmark notes", items = items })
+    vim.fn.setqflist({}, " ", { title = "redline notes", items = items })
     vim.cmd("copen")
 end
 
@@ -2601,7 +2601,7 @@ function M.yank()
     if #choices == 1 then return choices[1].fn() end
 
     vim.ui.select(choices, {
-        prompt = "diffmark: copy what?",
+        prompt = "redline: copy what?",
         format_item = function(c) return c.label end,
     }, function(c) if c then c.fn() end end)
 end
@@ -2613,7 +2613,7 @@ function M.yank_notes()
     sync_notes(bufnr)
     local fd = io.open(notes_path(root), "r")
     if not fd then
-        vim.notify("diffmark: no notes")
+        vim.notify("redline: no notes")
         return
     end
     local content = fd:read("*a")
@@ -2644,17 +2644,17 @@ function M.setup(opts)
         state.deletions_default = opts.deletions
         state.show_deleted = opts.deletions
     end
-    -- opts.github = false stops diffmark from ever shelling out to gh
+    -- opts.github = false stops redline from ever shelling out to gh
     if opts.github ~= nil then state.gh_enabled = opts.github end
     if opts.comments ~= nil then state.show_comments = opts.comments end
 
     apply_highlights()
     api.nvim_create_autocmd("ColorScheme", {
-        group = api.nvim_create_augroup("diffmark-colors", { clear = true }),
+        group = api.nvim_create_augroup("redline-colors", { clear = true }),
         callback = apply_highlights,
     })
 
-    local group = api.nvim_create_augroup("diffmark", { clear = true })
+    local group = api.nvim_create_augroup("redline", { clear = true })
 
     api.nvim_create_autocmd({ "BufEnter", "BufReadPost" }, {
         group = group,
@@ -2756,7 +2756,7 @@ function M.setup(opts)
         end,
     })
 
-    api.nvim_create_user_command("DiffMark", function(a)
+    api.nvim_create_user_command("Redline", function(a)
         local sub = a.args ~= "" and a.args or "status"
         local actions = {
             toggle = M.toggle,
@@ -2795,7 +2795,7 @@ function M.setup(opts)
             clearviewedall = function() M.clear_viewed(true) end,
         }
         local fn = actions[sub]
-        if fn then fn() else vim.notify("diffmark: unknown subcommand " .. sub, vim.log.levels.ERROR) end
+        if fn then fn() else vim.notify("redline: unknown subcommand " .. sub, vim.log.levels.ERROR) end
     end, {
         nargs = "?",
         complete = function()
@@ -2811,7 +2811,7 @@ function M.setup(opts)
     map("n", "<leader>hh", M.toggle, { desc = "Diff: line marks on (asks what to diff) / off" })
     map("n", "<leader>hr", M.reload, { desc = "Diff: reload base + index" })
     map("n", "<leader>hs", M.legend, { desc = "Diff: legend + counts" })
-    map("n", "<leader>h?", M.help, { desc = "Diff: help -- every diffmark mapping" })
+    map("n", "<leader>h?", M.help, { desc = "Diff: help -- every redline mapping" })
     map("n", "]h", function() M.next_hunk(false) end, { desc = "Diff: next changed line" })
     map("n", "[h", function() M.next_hunk(true) end, { desc = "Diff: prev changed line" })
     map("n", "<leader>hD", M.toggle_deleted, { desc = "Diff: hide / show removed code" })
@@ -2846,7 +2846,7 @@ function M.setup(opts)
     map("n", "<leader>hC", M.cycle_comments, { desc = "GitHub: cycle comment bodies off/cursor/all" })
     map("n", "<leader>hO", M.overview, { desc = "Diff: overview of every changed file" })
 
-    map("n", "<leader>hU", M.undo, { desc = "Diff: undo the last diffmark action" })
+    map("n", "<leader>hU", M.undo, { desc = "Diff: undo the last redline action" })
 
     if state.enabled then refresh(api.nvim_get_current_buf(), true) end
 end

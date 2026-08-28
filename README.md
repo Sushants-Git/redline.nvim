@@ -1,6 +1,6 @@
-# diffmark.nvim
+# redline.nvim
 
-**Review a diff without leaving the file.** Gitsigns marks the gutter; diffmark paints the
+**Review a diff without leaving the file.** Gitsigns marks the gutter; redline paints the
 whole line, shows you the code that was removed, pulls in the PR's review comments, and keeps
 track of what you have already read.
 
@@ -22,7 +22,7 @@ command.
 lazy.nvim:
 
 ```lua
-{ "Sushants-Git/diffmark.nvim", event = "VeryLazy", cmd = "DiffMark", opts = {} }
+{ "Sushants-Git/redline.nvim", event = "VeryLazy", cmd = "Redline", opts = {} }
 ```
 
 Optional: `nvim-telescope/telescope.nvim` and `nvim-tree/nvim-web-devicons` give you the
@@ -54,7 +54,7 @@ off. That is the whole entry point — there is no second mode key.
 
 The default branch is read from `git symbolic-ref refs/remotes/origin/HEAD` — whatever your
 repo actually uses, not a guess at `main`. On the default branch itself the merge-base *is*
-`HEAD`, so PR mode would show nothing; diffmark says so once instead of rendering an empty
+`HEAD`, so PR mode would show nothing; redline says so once instead of rendering an empty
 diff.
 
 ## Mappings
@@ -69,7 +69,7 @@ diff.
 | `]h` `[h` | next / previous hunk — including pure deletions |
 | `<leader>hs` | legend and counts on the message line |
 | `<leader>hr` | reload after committing, rebasing, or staging outside nvim |
-| `<leader>hU` | undo the last diffmark action |
+| `<leader>hU` | undo the last redline action |
 | `<leader>h?` | help |
 
 ### stage
@@ -147,14 +147,14 @@ under the cursor (the *whole* comment, not the one wrapped line) and `Y` copies 
 ## Undo
 
 `u` cannot reach any of this — none of it is buffer text. `<leader>hU` steps back through the
-diffmark actions that touched the git index, `.comments.txt`, or the viewed store: staging,
+redline actions that touched the git index, `.comments.txt`, or the viewed store: staging,
 unstaging, viewed ticks, notes. Index undo snapshots `git ls-files --stage` beforehand and
 restores through `update-index`, including the "was not staged at all" state.
 
 ## Setup options
 
 ```lua
-require("diffmark").setup({
+require("redline").setup({
   mode      = "worktree",  -- "worktree" | "commit" | "branch"
   enabled   = false,       -- true to have marks on from the moment nvim starts
   deletions = "all",       -- "all" | "cursor" | "off" — what opening a diff resets to
@@ -164,7 +164,7 @@ require("diffmark").setup({
 
 ## Commands
 
-`:DiffMark <action>`, with completion:
+`:Redline <action>`, with completion:
 
 ```
 toggle pick undo yank yanknotes overview overviewsplit
@@ -180,8 +180,8 @@ Four clearly different hues plus neutrals, rather than saturation variants of on
 "green vs slightly-duller green" is the one distinction the eye cannot make while scanning.
 Shape carries add/change/delete, colour carries staged/viewed, so neither channel has to do
 both jobs and it survives colourblindness. Every group is a normal highlight you can override:
-`DiffMarkAdd`, `DiffMarkChange`, `DiffMarkDelete`, `DiffMarkStaged`, `DiffMarkViewed`,
-`DiffMarkNote`, `DiffMarkGh`, each with an `…Ln` line variant.
+`RedlineAdd`, `RedlineChange`, `RedlineDelete`, `RedlineStaged`, `RedlineViewed`,
+`RedlineNote`, `RedlineGh`, each with an `…Ln` line variant.
 
 ## License
 
