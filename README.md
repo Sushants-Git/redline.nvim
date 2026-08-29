@@ -65,6 +65,7 @@ diff.
 | --- | --- |
 | `<leader>hh` | on (asks PR / latest commit / uncommitted), press again for off |
 | `<leader>hD` | hide / show removed code — it is on whenever you open a diff |
+| `<leader>hp` | read a long removed block in a float you can actually scroll |
 | `<leader>hO` | overview: every changed file, note and PR comment in one list |
 | `]h` `[h` | next / previous hunk — including pure deletions |
 | `<leader>hs` | legend and counts on the message line |
@@ -144,6 +145,26 @@ text, so `y` cannot reach them. This is the way out. One block copies as bare co
 paste back; a whole file gets `@@ path:line @@` headers. In the panels, `y` copies the entry
 under the cursor (the *whole* comment, not the one wrapped line) and `Y` copies everything.
 
+### long deletions
+
+Neovim counts `virt_lines` as **fill** lines, the same as diff filler. Measured behaviour:
+`<C-e>` steps through them one at a time, but `j` and `<C-d>` jump the whole block. So a
+removed block taller than your window is, in practice, unreachable — which is why a
+page-sized deletion reads as "it doesn't scroll".
+
+Blocks are therefore truncated to what fits the window, with a footer:
+
+```
+  ▁ removed line 14
+  ▁ removed line 15
+  ▁ … 185 more removed lines   <leader>hp to read
+```
+
+`<leader>hp` opens the whole block in a float. That is a normal scratch buffer holding real
+lines, so `j`, `<C-d>` and `G` all work, and it inherits the file's filetype so the removed
+code is syntax-highlighted. `y` copies the block, `q` closes. Set `deleted_max = 0` to draw
+everything inline regardless.
+
 ## Undo
 
 `u` cannot reach any of this — none of it is buffer text. `<leader>hU` steps back through the
@@ -158,6 +179,7 @@ require("redline").setup({
   mode      = "worktree",  -- "worktree" | "commit" | "branch"
   enabled   = false,       -- true to have marks on from the moment nvim starts
   deletions = "all",       -- "all" | "cursor" | "off" — what opening a diff resets to
+  deleted_max = "auto",    -- longest block drawn inline; a number, or 0 for no cap
   github    = true,        -- false stops it shelling out to gh entirely
 })
 ```

@@ -42,6 +42,7 @@ commands at all.
       mode      = "worktree",  -- "worktree" | "commit" | "branch"
       enabled   = false,       -- true: marks on from the moment nvim starts
       deletions = "all",       -- "all" | "cursor" | "off"
+      deleted_max = "auto",    -- longest block drawn inline, or a number, or 0
       github    = true,        -- false: never shell out to gh
     })
 <
@@ -72,6 +73,7 @@ rather than rendering an empty diff.
 diff ~
   <leader>hh    on (asks which diff) / off
   <leader>hD    hide / show removed code
+  <leader>hp    read a long removed block in a scrollable float
   <leader>hO    overview of every changed file, note and comment
   ]h  [h        next / previous hunk, deletions included
   <leader>hs    legend and counts
@@ -151,6 +153,17 @@ the notes file. With one option it copies without asking.
 A single block copies as bare code, ready to paste back. A whole file gets
 `@@ path:line @@` headers so you can tell where each piece came from. Text goes
 to both "+ and the unnamed register.
+
+LONG DELETIONS                                        *redline-long-deletions*
+
+Neovim counts virt_lines as fill lines, like diff filler. <C-e> steps through
+them one at a time, but `j` and <C-d> jump the whole block, so a removed block
+taller than the window cannot practically be read in the buffer.
+
+Blocks are truncated to what fits, with a footer line, and <leader>hp opens the
+full block in a float. That float is an ordinary scratch buffer of real lines,
+so all normal motions work, and it takes the file's filetype for syntax. `y`
+copies the block, `q` or <Esc> closes. deleted_max = 0 disables the cap.
 
 ==============================================================================
 9. UNDO                                                         *redline-undo*

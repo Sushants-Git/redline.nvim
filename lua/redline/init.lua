@@ -53,6 +53,12 @@ local state = {
     -- Removed code is the half of a review you cannot reconstruct from the
     -- buffer, so it is on unless you configure otherwise.
     deletions_default = "all",
+    -- Longest removed block drawn inline. Past this you get a footer and the
+    -- full text in a float, because Neovim counts virt_lines as *fill* lines:
+    -- <C-e> walks them one at a time, but j and <C-d> jump the whole block, so
+    -- a page-sized deletion is effectively unreachable in the buffer.
+    -- "auto" = whatever fits the window; a number to fix it; 0 for no cap.
+    deleted_max = "auto",
     roots = {},        -- bufnr -> root path | false
     base = {},         -- bufnr -> { rev = string, text = string }
     index = {},        -- bufnr -> string (contents of the file in the index)
@@ -374,6 +380,26 @@ end
 --   off     nothing, just the gutter glyph (as before)
 --   cursor  only the block the cursor is sitting in unfolds
 --   all     every removed block, for reading a branch top to bottom
+-- Neovim reports virt_lines as fill lines. Measured: <C-e> steps through them
+-- (topfill 21, 20, 19 ...) but `j` and <C-d> skip the block whole, so anything
+-- taller than the window can only be reached one <C-e> at a time. Rather than
+-- ask that of anyone, long blocks are truncated here and read in full with
+-- <leader>hp.
+local function deleted_cap(bufnr)
+    local cap = state.deleted_max
+    if type(cap) == "number" then return cap end
+    if cap == false then return 0 end
+    -- auto: leave room for the anchor line and some real code around it
+    local height
+    for _, w in ipairs(api.nvim_list_wins()) do
+        if api.nvim_win_get_buf(w) == bufnr then
+            height = api.nvim_win_get_height(w)
+            break
+        end
+    end
+    return math.max(8, (height or vim.o.lines) - 6)
+end
+
 local function render_deletions(bufnr)
     if not api.nvim_buf_is_valid(bufnr) then return end
     api.nvim_buf_clear_namespace(bufnr, ns_del, 0, -1)
@@ -397,17 +423,35 @@ local function render_deletions(bufnr)
         if (not cur or (cur >= b.lo and cur <= b.hi)) and b.row >= 0 and b.row < total then
             -- virt_text does not expand tabs, and an unpadded chunk paints only
             -- as wide as its text -- pad to the widest line so it reads as a block
+            local cap = deleted_cap(bufnr)
+            local shown = #b.lines
+            if cap > 0 and shown > cap then shown = cap - 1 end -- room for the footer
+
             local expanded, width = {}, 0
-            for i, l in ipairs(b.lines) do
-                local text = l:gsub("\t", string.rep(" ", ts))
+            for i = 1, shown do
+                local text = b.lines[i]:gsub("\t", string.rep(" ", ts))
                 expanded[i] = text
                 width = math.max(width, vim.fn.strdisplaywidth(text))
             end
+            local hidden = #b.lines - shown
+            local footer
+            if hidden > 0 then
+                footer = string.format("… %d more removed line%s   <leader>hp to read",
+                    hidden, hidden == 1 and "" or "s")
+                width = math.max(width, vim.fn.strdisplaywidth(footer))
+            end
+
             local virt = {}
             for i, text in ipairs(expanded) do
                 virt[i] = {
                     { GLYPH.delete .. " ", "RedlineDeleteVirt" },
                     { text .. string.rep(" ", width - vim.fn.strdisplaywidth(text) + 1), "RedlineDeleteLn" },
+                }
+            end
+            if footer then
+                virt[#virt + 1] = {
+                    { GLYPH.delete .. " ", "RedlineDeleteVirt" },
+                    { footer .. string.rep(" ", width - vim.fn.strdisplaywidth(footer) + 1), "RedlineDelete" },
                 }
             end
             pcall(api.nvim_buf_set_extmark, bufnr, ns_del, b.row, 0, {
@@ -1808,6 +1852,7 @@ local HELP = {
     { "<leader>hO", "overview: telescope popup of every changed file, note and PR comment" },
     { "", "type to filter across paths, authors and comment text; preview on the right" },
     { "<leader>hD", "hide / show removed code (it is on whenever you open a diff)" },
+    { "<leader>hp", "read a long removed block in a float you can actually scroll" },
     { "<leader>hU", "undo the last redline action (stage / viewed / note -- not buffer edits)" },
     false,
     "stage",
@@ -2536,6 +2581,64 @@ local function comments_text(items)
     return vim.trim(table.concat(out, "\n"))
 end
 
+-- The way out of the fill-line problem: a normal scratch buffer in a float.
+-- Real lines, so j/k/<C-d>/G all work, and it carries the source buffer's
+-- filetype so the removed code is syntax-highlighted.
+function M.peek()
+    local bufnr = api.nvim_get_current_buf()
+    local b = del_block_at(bufnr, api.nvim_win_get_cursor(0)[1])
+    if not b then
+        M.legend("no removed code on this line")
+        return
+    end
+
+    local buf = api.nvim_create_buf(false, true)
+    api.nvim_buf_set_lines(buf, 0, -1, false, b.lines)
+    vim.bo[buf].modifiable = false
+    vim.bo[buf].bufhidden = "wipe"
+    vim.bo[buf].filetype = vim.bo[bufnr].filetype
+
+    local width = 0
+    for _, l in ipairs(b.lines) do
+        width = math.max(width, vim.fn.strdisplaywidth(l:gsub("\t", string.rep(" ", vim.bo[bufnr].tabstop))))
+    end
+    width = math.min(math.max(width + 2, 40), math.floor(vim.o.columns * 0.9))
+    local height = math.min(#b.lines, math.floor(vim.o.lines * 0.8))
+
+    local root = current_root()
+    local rel = root and relpath(root, bufnr) or api.nvim_buf_get_name(bufnr)
+    local win = api.nvim_open_win(buf, true, {
+        relative = "editor",
+        width = width,
+        height = height,
+        row = math.floor((vim.o.lines - height) / 2) - 1,
+        col = math.floor((vim.o.columns - width) / 2),
+        style = "minimal",
+        border = "rounded",
+        title = string.format(" %s removed at %s:%d — %d line%s ", GLYPH.delete, rel,
+            b.row + 1, #b.lines, #b.lines == 1 and "" or "s"),
+        title_pos = "center",
+    })
+    vim.wo[win].winhl = "Normal:RedlineDeleteLn,FloatBorder:RedlineDelete,FloatTitle:RedlineDelete"
+    vim.wo[win].cursorline = true
+    vim.wo[win].number = true
+    vim.wo[win].wrap = false
+
+    local function close()
+        if api.nvim_win_is_valid(win) then api.nvim_win_close(win, true) end
+    end
+    for _, k in ipairs({ "q", "<Esc>" }) do
+        vim.keymap.set("n", k, close, { buffer = buf, nowait = true, desc = "close" })
+    end
+    vim.keymap.set("n", "y", function()
+        local text = table.concat(b.lines, "\n")
+        vim.fn.setreg("+", text)
+        vim.fn.setreg('"', text)
+        close()
+        M.legend(string.format("copied %d removed line%s", #b.lines, #b.lines == 1 and "" or "s"))
+    end, { buffer = buf, nowait = true, desc = "copy the whole block" })
+end
+
 function M.yank()
     local bufnr = api.nvim_get_current_buf()
     local root = current_root()
@@ -2640,6 +2743,7 @@ function M.setup(opts)
     state.mode = opts.mode or state.mode
     -- opts.enabled = true opts you back in to marks from the moment nvim starts
     if opts.enabled ~= nil then state.enabled = opts.enabled end
+    if opts.deleted_max ~= nil then state.deleted_max = opts.deleted_max end
     if opts.deletions ~= nil then
         state.deletions_default = opts.deletions
         state.show_deleted = opts.deletions
@@ -2764,6 +2868,7 @@ function M.setup(opts)
             undo = M.undo,
             gh = M.gh_toggle,
             yank = M.yank,
+            peek = M.peek,
             yanknotes = M.yank_notes,
             ghsync = function() M.gh_sync() end,
             overview = M.overview,
@@ -2814,6 +2919,7 @@ function M.setup(opts)
     map("n", "<leader>h?", M.help, { desc = "Diff: help -- every redline mapping" })
     map("n", "]h", function() M.next_hunk(false) end, { desc = "Diff: next changed line" })
     map("n", "[h", function() M.next_hunk(true) end, { desc = "Diff: prev changed line" })
+    map("n", "<leader>hp", M.peek, { desc = "Diff: read the removed block in a float" })
     map("n", "<leader>hD", M.toggle_deleted, { desc = "Diff: hide / show removed code" })
 
     map("n", "<leader>hS", function() M.stage() end, { desc = "Stage: hunk under cursor" })
