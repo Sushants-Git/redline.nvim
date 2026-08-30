@@ -163,7 +163,8 @@ taller than the window cannot practically be read in the buffer.
 Blocks are truncated to what fits, with a footer line, and <leader>hp opens the
 full block in a float. That float is an ordinary scratch buffer of real lines,
 so all normal motions work, and it takes the file's filetype for syntax. `y`
-copies the block, `q` or <Esc> closes. deleted_max = 0 disables the cap.
+copies the block, `q`, <Esc> or <CR> closes.
+When several blocks cover the same line, the truncated one wins. deleted_max = 0 disables the cap.
 
 ==============================================================================
 9. UNDO                                                         *redline-undo*

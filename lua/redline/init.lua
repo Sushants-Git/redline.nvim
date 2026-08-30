@@ -1974,7 +1974,7 @@ function M.help()
     })
     vim.wo[win].cursorline = false
 
-    for _, k in ipairs({ "q", "<Esc>" }) do
+    for _, k in ipairs({ "q", "<Esc>", "<CR>" }) do
         vim.keymap.set("n", k, function()
             if api.nvim_win_is_valid(win) then api.nvim_win_close(win, true) end
         end, { buffer = buf, nowait = true })
@@ -2547,10 +2547,30 @@ local function copy_out(text, what)
     M.legend(string.format("copied %s (%d line%s)", what, n, n == 1 and "" or "s"))
 end
 
+-- Several blocks can claim the same line: at the top of a heavily deleted file
+-- a pure deletion (lo=1, hi=2) and a change block starting at line 1 both cover
+-- it. Returning whichever came first meant <leader>hp would open a two-line
+-- block while the screen was full of a truncated one, so rank them: a block we
+-- had to truncate wins (reading those is the whole point of the float), then
+-- the longer block wins.
+local function was_truncated(bufnr, b)
+    local cap = deleted_cap(bufnr)
+    return cap > 0 and #b.lines > cap
+end
+
 local function del_block_at(bufnr, lnum)
+    local best
     for _, b in ipairs(state.deletions[bufnr] or {}) do
-        if lnum >= b.lo and lnum <= b.hi then return b end
+        if lnum >= b.lo and lnum <= b.hi then
+            if not best then
+                best = b
+            else
+                local bt, ct = was_truncated(bufnr, b), was_truncated(bufnr, best)
+                if (bt and not ct) or (bt == ct and #b.lines > #best.lines) then best = b end
+            end
+        end
     end
+    return best
 end
 
 -- one block copies as bare code, ready to paste back in; the whole file gets
@@ -2587,6 +2607,18 @@ end
 function M.peek()
     local bufnr = api.nvim_get_current_buf()
     local b = del_block_at(bufnr, api.nvim_win_get_cursor(0)[1])
+    if not b then
+        -- cursor is in no block at all: if exactly one block in the file had to
+        -- be truncated, that is the one the footer was advertising
+        local only
+        for _, x in ipairs(state.deletions[bufnr] or {}) do
+            if was_truncated(bufnr, x) then
+                if only then only = nil break end
+                only = x
+            end
+        end
+        b = only
+    end
     if not b then
         M.legend("no removed code on this line")
         return
@@ -2627,7 +2659,7 @@ function M.peek()
     local function close()
         if api.nvim_win_is_valid(win) then api.nvim_win_close(win, true) end
     end
-    for _, k in ipairs({ "q", "<Esc>" }) do
+    for _, k in ipairs({ "q", "<Esc>", "<CR>" }) do
         vim.keymap.set("n", k, close, { buffer = buf, nowait = true, desc = "close" })
     end
     vim.keymap.set("n", "y", function()

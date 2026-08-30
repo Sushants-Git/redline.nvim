@@ -162,7 +162,11 @@ Blocks are therefore truncated to what fits the window, with a footer:
 
 `<leader>hp` opens the whole block in a float. That is a normal scratch buffer holding real
 lines, so `j`, `<C-d>` and `G` all work, and it inherits the file's filetype so the removed
-code is syntax-highlighted. `y` copies the block, `q` closes. Set `deleted_max = 0` to draw
+code is syntax-highlighted. `y` copies the block, `q` / `<Esc>` / `<CR>` closes.
+
+When several removed blocks land on the same line — imports stripped from the top *and* a body
+removed below both anchor at line 1 — `<leader>hp` picks the one that was truncated, since
+reading those is the entire reason the float exists. Set `deleted_max = 0` to draw
 everything inline regardless.
 
 ## Undo
