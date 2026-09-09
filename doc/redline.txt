@@ -41,19 +41,19 @@ commands at all.
     require("redline").setup({
       mode      = "worktree",  -- "worktree" | "commit" | "branch"
       enabled   = false,       -- true: marks on from the moment nvim starts
+      keymaps   = true,        -- false: install no default mappings
       deletions = "all",       -- "all" | "cursor" | "off"
       deleted_max = "auto",    -- longest block drawn inline, or a number, or 0
       github    = true,        -- false: never shell out to gh
     })
 <
 `deletions` is what opening a diff resets to, not just the initial value.
-Hiding removed code with |<leader>hD| is treated as a momentary "get out of my
-way", so it survives neither a restart nor the next <leader>hh.
+Hiding removed code through Settings is temporary: opening review resets it.
 
 ==============================================================================
 4. MODES                                                       *redline-modes*
 
-<leader>hh asks which diff you want:
+<leader>ho or :Redline asks which diff you want, then opens the overview:
 
   PR diff        merge-base with the default branch. The whole branch:
                  committed work and uncommitted edits together.
@@ -68,58 +68,38 @@ rather than rendering an empty diff.
 ==============================================================================
 5. MAPPINGS                                                 *redline-mappings*
 
-<leader>h? lists all of these inside nvim.
+Current default mappings (leader is not set by Redline):
+  <leader>ho    choose review context, then overview
+  <leader>ha    actions (normal / visual)
+  <leader>hc    note (normal / visual, calls add_note(first, last))
+  <leader>hv    viewed (normal / visual)
+  ]h / [h      next / previous hunk
+  <leader>h?    current help
 
-diff ~
-  <leader>hh    on (asks which diff) / off
-  <leader>hD    hide / show removed code
-  <leader>hp    read a long removed block in a scrollable float
-  <leader>hO    overview of every changed file, note and comment
-  ]h  [h        next / previous hunk, deletions included
-  <leader>hs    legend and counts
-  <leader>hr    reload after commit / rebase / outside staging
-  <leader>hU    undo the last redline action
-  <leader>h?    help
+Telescope: Enter opens; Ctrl-a / normal a closes the picker, opens the selected
+file and offers actions. Normal ? opens help. Split fallback: Enter, a, ?, q.
+Missing/deleted files open a read-only disk diff; file mutations are unavailable.
+The context chooser names the actual detected default branch, not always main.
 
-stage ~
-  <leader>hS    stage the hunk under the cursor (visual: the selection)
-  <leader>hA    stage the whole file
-  <leader>hu    unstage the whole file
-
-viewed ~
-  <leader>hv    tick off the hunk under the cursor (visual: the selection)
-  <leader>hV    clear in this file
-  <leader>hZ    clear in the whole repo
-
-github ~
-  <leader>hg    PR comments off / on
-  <leader>hG    open / close the comments panel
-  <leader>hC    comment bodies: off / under cursor / all
-
-notes ~
-  <leader>hc    add / edit a note on this line (empty input deletes)
-  <leader>hd    delete the note on this line
-  <leader>hl    list every note (quickfix)
-  <leader>ho    open .comments.txt
-  <leader>hX    delete all notes
-
-copy ~
-  <leader>hy    copy removed code / PR comments / notes
+Use actions for staging, notes, copying, peek, refresh, undo and publishing.
+Settings controls overlay, deleted code and GitHub comment visibility.
+Old default shortcuts are no longer installed; Lua APIs remain available.
 
 In either panel: <CR> jumps to the line, y copies the entry, Y copies the whole
 panel, q closes.
 
-Viewed marks are keyed on the hash of the line's text, not its number, so they
-follow the line as you edit above it and un-tick themselves the moment the line
-itself changes.
+Viewed marks identify individual changed-line occurrences, not shared text hashes.
+They follow edits in an open buffer and invalidate when content changes. Saved
+marks restore only with a matching file snapshot; external edits may reset them.
+Legacy text-only marks are discarded. History never adds unchanged overview files.
 
 ==============================================================================
 6. GITHUB COMMENTS                                            *redline-github*
 
 Review comments are fetched automatically the first time you open a diff in a
-repo: one `gh` call per repo per session, asynchronous, with a spinner in the
+repo: one automatic fetch attempt per repo per session, with a spinner in the
 bottom-right corner. It never opens a split under you and a repo with no PR is
-silent rather than an error. <leader>hg turns them off, and on again (which
+silent rather than an error. Settings turns them off, and on again (which
 refetches rather than restoring a stale list).
 
 Comments ride on extmarks, so they drift with your edits. A comment whose line
@@ -134,18 +114,20 @@ explicit PR number, for reviewing a PR that is not your current branch:
 ==============================================================================
 7. NOTES                                                       *redline-notes*
 
-Notes live in <repo>/.comments.txt as `path:line: text` — the shape an agent
-can read back. They follow the line while you edit, and the file is rewritten
-with fresh line numbers on every save.
+Notes live in <repo>/.comments.txt as `path:line: text` or `path:start-end: text`.
+Normal <leader>hc comments the current chunk or edits the note under the cursor;
+visual <leader>hc comments selected lines. Endpoints follow edits and update on
+save. Legacy notes still load. Deletion-only chunks anchor to a surviving line;
+one note can exist per start line.
 
-Two nvim instances in one repo do not clobber each other: every write is
-authoritative only for the paths it owns and re-reads the rest from disk first.
+Concurrent instances preserve other paths' notes by re-reading disk. Simultaneous
+edits to the same path remain last-writer-wins.
 
 ==============================================================================
 8. COPYING                                                      *redline-copy*
 
 Removed code is drawn with virt_lines and comments with virt_text. Neither is
-buffer text, so `y` cannot reach them. <leader>hy offers whatever applies where
+buffer text, so `y` cannot reach them. Copy contextual code/comments offers what applies where
 the cursor is: the removed block under it, every removed block in the file, the
 comment on this line, the comments in this file, every comment on the PR, or
 the notes file. With one option it copies without asking.
@@ -160,7 +142,7 @@ Neovim counts virt_lines as fill lines, like diff filler. <C-e> steps through
 them one at a time, but `j` and <C-d> jump the whole block, so a removed block
 taller than the window cannot practically be read in the buffer.
 
-Blocks are truncated to what fits, with a footer line, and <leader>hp opens the
+Blocks are truncated to what fits, with a footer line, and Peek removed code opens the
 full block in a float. That float is an ordinary scratch buffer of real lines,
 so all normal motions work, and it takes the file's filetype for syntax. `y`
 copies the block, `q`, <Esc> or <CR> closes.
@@ -169,7 +151,7 @@ When several blocks cover the same line, the truncated one wins. deleted_max = 0
 ==============================================================================
 9. UNDO                                                         *redline-undo*
 
-|u| cannot reach any of this, because none of it is buffer text. <leader>hU
+|u| cannot reach any of this, because none of it is buffer text. The Undo action
 steps back through the redline actions that touched the git index,
 .comments.txt or the viewed store: staging, unstaging, viewed ticks, notes.
 
@@ -179,15 +161,35 @@ with `git update-index`, including the "was not in the index at all" state.
 ==============================================================================
 10. COMMANDS                                                *redline-commands*
 
-`:Redline {action}`, with completion:
+`:Redline` chooses context then overview. Completion exposes only:
 >
-    toggle pick undo yank yanknotes overview overviewsplit
-    gh ghsync ghpanel ghclear
-    comments commentsoff commentscursor commentsall
-    worktree commit branch reload refresh status legend help notes
-    deletions deloff delcursor delall
-    stage stagefile unstage viewed clearviewed clearviewedall
+    open actions diff help
 <
+Shipped old subcommands remain hidden aliases.
+
+:Redline diff opens a read-only scratch buffer: / searches added and removed
+text, n/N moves between matches, q closes. It includes untracked files and Git's
+no-final-newline markers. DISK SNAPSHOT means unsaved buffers are excluded;
+the overlay uses live buffers, while overview statistics also come from disk.
+
+Copy AI handoff confirms before copying saved notes + context + base + disk
+diff. It uses the unnamed register and available clipboard, is provider-neutral,
+and never executes an agent. Check for secrets before sharing.
+
+Actions cover stage hunk/selection/file, unstage, notes, viewed, peek, refresh,
+settings, undo, copying, commit staged, push, and create/open PR.
+Visual staging stages only selected added/replacement lines, even in untracked
+files, from the buffer without writing it. Replacements pair old/new lines by
+position in fresh index hunks, retaining unselected old lines. Surplus deleted
+lines stage only when the entire replacement is selected. Pure deletions cannot
+be visually selected; use Stage hunk at the deletion anchor or stage the file.
+Normal cursor staging stages whole hunks. All visual selections are line-based.
+Commit asks for message and confirmation of staged summary, never auto-stages.
+Push asks for remote, destination branch and confirmation; never force-pushes.
+Create PR asks for title, body, base, draft/ready and final confirmation.
+Push separately first: explicit --head prevents gh from auto-pushing.
+Network operations are asynchronous argv calls, without shell interpolation.
+Commit/push/PR cannot be undone by Redline. github=false disables PR actions.
 ==============================================================================
 11. HIGHLIGHTS                                            *redline-highlights*
 

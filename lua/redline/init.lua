@@ -11,9 +11,8 @@
 --   gutter glyph  ┃ added   ╏ changed   ▁ removed   ✓ viewed
 --   line colour   green unstaged / amber already in the index / grey viewed
 --
--- "viewed" is keyed on the hash of the line's text, not its number, so it
--- follows the line around and quietly un-marks itself the moment the line
--- changes again -- which is what you want while reviewing.
+-- "viewed" tracks individual occurrences with extmarks and validates the diff
+-- content before displaying a mark. Identical lines do not share review state.
 --
 -- On top of that: line notes. Drop a temporary note on any line, it is stored
 -- in <repo>/.comments.txt as "path:line: text", which is exactly the shape an
@@ -70,7 +69,7 @@ local state = {
     counts = {},       -- bufnr -> { changed, staged, viewed }
     notes = {},        -- root -> { [relpath] = { [lnum] = text } }
     note_ids = {},     -- bufnr -> { [extmark_id] = text }
-    viewed = nil,      -- root -> { [relpath] = { [linehash] = true } }
+    viewed = nil,      -- root -> { [relpath] = { [id] = viewed record } }
     timers = {},       -- bufnr -> timer
     default_branch = {}, -- root -> ref name | false
     notes_mtime = {},  -- root -> mtime of .comments.txt when we last read it
@@ -181,6 +180,7 @@ end
 -- find a repo from them -- which meant opening one panel while standing in
 -- another silently did nothing. Fall back to the cwd.
 local function current_root()
+    if vim.b.redline_root then return vim.b.redline_root end
     local root = get_root(api.nvim_get_current_buf())
     if root then return root end
     local res = vim.system({ "git", "-C", vim.fn.getcwd(), "rev-parse", "--show-toplevel" },
@@ -213,7 +213,7 @@ end
 -- The index entry for one path: mode, blob sha. `false` means "not staged at
 -- all", which is a state we have to be able to restore too.
 local function index_entry(root, rel)
-    local out = git(root, { "ls-files", "--stage", "--", rel })
+    local out = git(root, { "--literal-pathspecs", "ls-files", "--stage", "--", rel })
     if not out or vim.trim(out) == "" then return false end
     local mode, sha = out:match("^(%d+)%s+(%x+)")
     if not mode then return false end
@@ -222,7 +222,7 @@ end
 
 local function restore_index(root, rel, snap)
     if snap == false then
-        return git(root, { "update-index", "--force-remove", "--", rel }) ~= nil
+        return git(root, { "--literal-pathspecs", "update-index", "--force-remove", "--", rel }) ~= nil
     end
     -- --add, because the path may have been removed from the index entirely
     return git(root, { "update-index", "--add", "--cacheinfo",
@@ -325,7 +325,7 @@ local function index_text(bufnr, root, rel)
 end
 
 local function buf_text(bufnr)
-    return table.concat(api.nvim_buf_get_lines(bufnr, 0, -1, false), "\n") .. "\n"
+    return require("redline.viewed").buffer_text(bufnr)
 end
 
 local function split(text)
@@ -333,8 +333,11 @@ local function split(text)
 end
 
 -- ─────────────────────────────
--- viewed state (line-hash based, persisted outside the repo)
+-- Viewed records are occurrence-specific; extmarks track them while editing.
 -- ─────────────────────────────
+
+local viewed_helpers = require("redline.viewed")
+local viewed_candidates = {}
 
 local function viewed_path()
     return vim.fn.stdpath("data") .. "/redline-viewed.json"
@@ -347,17 +350,21 @@ local function load_viewed()
         state.viewed = {}
         return state.viewed
     end
-    local ok, decoded = pcall(vim.json.decode, fd:read("*a"))
+    local decoded = viewed_helpers.decode(fd:read("*a"))
     fd:close()
-    state.viewed = (ok and type(decoded) == "table") and decoded or {}
+    state.viewed = decoded
     return state.viewed
 end
 
 local function save_viewed()
-    local fd = io.open(viewed_path(), "w")
+    vim.fn.mkdir(vim.fn.stdpath("data"), "p")
+    local path = viewed_path()
+    local temporary = path .. "." .. vim.fn.getpid() .. ".tmp"
+    local fd = io.open(temporary, "w")
     if not fd then return end
-    fd:write(vim.json.encode(state.viewed or {}))
+    local ok = fd:write(vim.json.encode({ version = 2, roots = state.viewed or {} }))
     fd:close()
+    if ok then os.rename(temporary, path) else os.remove(temporary) end
 end
 
 local function line_hash(text)
@@ -436,7 +443,7 @@ local function render_deletions(bufnr)
             local hidden = #b.lines - shown
             local footer
             if hidden > 0 then
-                footer = string.format("… %d more removed line%s   <leader>hp to read",
+                footer = string.format("… %d more removed line%s   <leader>ha: Peek to read",
                     hidden, hidden == 1 and "" or "s")
                 width = math.max(width, vim.fn.strdisplaywidth(footer))
             end
@@ -465,6 +472,7 @@ end
 
 local function render_diff(bufnr)
     if not api.nvim_buf_is_valid(bufnr) then return end
+    viewed_candidates[bufnr] = {}
     api.nvim_buf_clear_namespace(bufnr, ns_diff, 0, -1)
     api.nvim_buf_clear_namespace(bufnr, ns_del, 0, -1)
     state.hunks[bufnr] = {}
@@ -509,10 +517,24 @@ local function render_diff(bufnr)
     for _, h in ipairs(vs_base) do
         local old_start, old_count, new_start, new_count = h[1], h[2], h[3], h[4]
         local kind = (new_count == 0 and "delete") or (old_count == 0 and "add") or "change"
+        base_lines = base_lines or split(base_text(bufnr, root, rel))
+        local old = {}
+        for i = old_start, old_start + old_count - 1 do old[#old + 1] = base_lines[i] end
+        local function fingerprint(lnum)
+            return line_hash(vim.json.encode({ kind, old, lines[lnum],
+                lnum == total and not vim.bo[bufnr].endofline or false,
+                new_count == 0 and new_start == 0 or false,
+                old_count > 0 and old_start + old_count - 1 == #base_lines
+                    and base_text(bufnr, root, rel):sub(-1) ~= "\n" or false }))
+        end
         if kind == "delete" then
-            marked[#marked + 1] = { math.max(new_start, 1), kind }
+            local lnum = math.max(new_start, 1)
+            marked[#marked + 1] = { lnum, kind, fingerprint(lnum) }
         else
-            for i = 0, new_count - 1 do marked[#marked + 1] = { new_start + i, kind } end
+            for i = 0, new_count - 1 do
+                local lnum = new_start + i
+                marked[#marked + 1] = { lnum, kind, fingerprint(lnum) }
+            end
         end
 
         if old_count > 0 then
@@ -546,14 +568,15 @@ local function render_diff(bufnr)
     end
     state.deletions[bufnr] = deletions
 
-    local seen = viewed_for(root, rel)
+    viewed_candidates[bufnr] = marked
+    local seen = viewed_helpers.match(bufnr, viewed_for(root, rel), marked, vim.fn.sha256(cur))
     local counts = state.counts[bufnr]
 
-    for _, m in ipairs(marked) do
+    for i, m in ipairs(marked) do
         local lnum, kind = m[1], m[2]
         if lnum >= 1 and lnum <= total then
             local is_staged = not unstaged[lnum]
-            local is_viewed = seen[line_hash(lines[lnum])] == true
+            local is_viewed = seen[i] ~= nil
 
             local group, glyph
             if is_viewed then
@@ -587,6 +610,16 @@ end
 -- notes (.comments.txt)
 -- ─────────────────────────────
 
+local note_ranges = {} -- root -> relpath -> start line -> inclusive end line
+
+local function note_end(root, rel, first)
+    return ((note_ranges[root] or {})[rel] or {})[first] or first
+end
+
+local function note_label(first, last)
+    return last and last > first and (first .. "-" .. last) or tostring(first)
+end
+
 local function notes_path(root)
     return root .. "/" .. NOTES_FILE
 end
@@ -595,21 +628,27 @@ end
 -- so it is the source of truth and our copy is only a cache. Re-read whenever
 -- the mtime moves.
 local function read_notes_file(root)
-    local notes = {}
+    local notes, ranges = {}, {}
     local fd = io.open(notes_path(root), "r")
     if fd then
         for line in fd:lines() do
             if not line:match("^%s*#") and vim.trim(line) ~= "" then
-                local rel, lnum, text = line:match("^([^:]+):(%d+):%s?(.*)$")
-                if rel then
+                local rel, lnum, last, text = line:match("^([^:]+):(%d+)%-(%d+):%s?(.*)$")
+                if not rel then
+                    rel, lnum, text = line:match("^([^:]+):(%d+):%s?(.*)$")
+                end
+                lnum, last = tonumber(lnum), tonumber(last)
+                if rel and lnum >= 1 and (not last or last >= lnum) then
                     notes[rel] = notes[rel] or {}
-                    notes[rel][tonumber(lnum)] = text
+                    ranges[rel] = ranges[rel] or {}
+                    notes[rel][lnum] = text
+                    ranges[rel][lnum] = last
                 end
             end
         end
         fd:close()
     end
-    return notes
+    return notes, ranges
 end
 
 local function notes_mtime(root)
@@ -623,7 +662,7 @@ local function load_notes(root)
     if state.notes[root] and state.notes_mtime[root] == mt then
         return state.notes[root]
     end
-    state.notes[root] = read_notes_file(root)
+    state.notes[root], note_ranges[root] = read_notes_file(root)
     state.notes_mtime[root] = mt
     return state.notes[root]
 end
@@ -635,29 +674,35 @@ end
 -- deliberately destructive rewrites (clear all).
 local function write_notes(root, owned)
     local mem = state.notes[root] or {}
-    local notes
+    local notes, ranges
+    local mem_ranges = note_ranges[root] or {}
     if owned then
-        notes = read_notes_file(root)
-        for rel in pairs(owned) do notes[rel] = mem[rel] end
+        notes, ranges = read_notes_file(root)
+        for rel in pairs(owned) do
+            notes[rel], ranges[rel] = mem[rel], mem_ranges[rel]
+        end
     else
-        notes = mem
+        notes, ranges = mem, mem_ranges
     end
 
     local rels = vim.tbl_keys(notes)
     table.sort(rels)
 
     local lines = vim.deepcopy(NOTES_HEADER)
+    lines[1] = "# temp notes for the agent -- format: path:line: note or path:start-end: note"
     local count = 0
     for _, rel in ipairs(rels) do
         local lnums = vim.tbl_keys(notes[rel])
         table.sort(lnums)
         for _, lnum in ipairs(lnums) do
-            lines[#lines + 1] = string.format("%s:%d: %s", rel, lnum, notes[rel][lnum])
+            lines[#lines + 1] = string.format("%s:%s: %s", rel,
+                note_label(lnum, (ranges[rel] or {})[lnum]), notes[rel][lnum])
             count = count + 1
         end
     end
 
     state.notes[root] = notes
+    note_ranges[root] = ranges
 
     local path = notes_path(root)
     if count == 0 then
@@ -691,11 +736,19 @@ local function render_notes(bufnr)
     local total = api.nvim_buf_line_count(bufnr)
     for lnum, text in pairs(notes) do
         if lnum >= 1 and lnum <= total then
+            local last = math.min(total, note_end(root, rel, lnum))
             local ok, id = pcall(api.nvim_buf_set_extmark, bufnr, ns_note, lnum - 1, 0, {
+                end_row = last,
+                end_col = 0,
+                right_gravity = true,
+                end_right_gravity = false,
+                hl_group = "RedlineNoteLn",
+                hl_eol = true,
                 sign_text = "󰆉",
                 sign_hl_group = "RedlineNote",
                 line_hl_group = "RedlineNoteLn",
-                virt_text = { { "  " .. text, "RedlineNote" } },
+                virt_text = { { "  " .. (last > lnum and ("[" .. note_label(lnum, last) .. "] ") or "")
+                    .. text, "RedlineNote" } },
                 virt_text_pos = "eol",
                 priority = 9,
             })
@@ -714,22 +767,36 @@ local function sync_notes(bufnr)
     local ids = state.note_ids[bufnr]
     if not ids or vim.tbl_isempty(ids) then return end
 
-    local fresh = {}
+    local fresh, ranges = {}, {}
+    local total = api.nvim_buf_line_count(bufnr)
     for id, text in pairs(ids) do
-        local pos = api.nvim_buf_get_extmark_by_id(bufnr, ns_note, id, {})
-        if pos and pos[1] then fresh[pos[1] + 1] = text end
+        local pos = api.nvim_buf_get_extmark_by_id(bufnr, ns_note, id, { details = true })
+        if pos and pos[1] then
+            local first = math.min(total, pos[1] + 1)
+            fresh[first] = text
+            ranges[first] = math.max(first, math.min(total, pos[3].end_row or first))
+        end
     end
     local notes = load_notes(root)
     notes[rel] = next(fresh) and fresh or nil
+    note_ranges[root][rel] = next(fresh) and ranges or nil
     write_notes(root, { [rel] = true })
 end
 
 local function note_at_cursor(bufnr, lnum)
-    local marks = api.nvim_buf_get_extmarks(bufnr, ns_note, { lnum - 1, 0 }, { lnum - 1, -1 }, {})
+    local marks = api.nvim_buf_get_extmarks(bufnr, ns_note, 0, -1, { details = true })
     local ids = state.note_ids[bufnr] or {}
+    local best, first, last
     for _, m in ipairs(marks) do
-        if ids[m[1]] then return m[1], ids[m[1]] end
+        local lo = math.min(api.nvim_buf_line_count(bufnr), m[2] + 1)
+        local hi = math.max(lo, m[4].end_row or lo)
+        -- Nested notes select the narrowest range; ties prefer the later start.
+        if ids[m[1]] and lnum >= lo and lnum <= hi
+            and (not best or hi - lo <= last - first) then
+            best, first, last = m[1], lo, hi
+        end
     end
+    if best then return best, ids[best], first, last end
 end
 
 
@@ -1154,14 +1221,28 @@ local function overview_data(root)
         if files[rel] then files[rel].first = lnum end
     end
 
-    -- Viewed marks pull a file into the list even when its diff is gone: you
-    -- put them there deliberately, so the file staying visible is a record of
-    -- what you reviewed, not noise. Same reasoning as notes and PR comments.
+    -- History alone is not a current diff. Validate counts against the current
+    -- buffer (or a temporary disk buffer), rather than counting stored records.
     local viewed = (load_viewed() or {})[root] or {}
-    for rel, hashes in pairs(viewed) do
-        local n = 0
-        for _ in pairs(hashes) do n = n + 1 end
-        slot(rel).viewed = n
+    for rel in pairs(viewed) do
+        local f = files[rel]
+        local buf = vim.fn.bufnr(root .. "/" .. rel)
+        if (buf ~= -1 and api.nvim_buf_is_loaded(buf)) or (f and (f.changed or f.untracked)) then
+            local created = buf == -1
+            local temporary = buf == -1 or not api.nvim_buf_is_loaded(buf)
+            if temporary then
+                buf = vim.fn.bufadd(root .. "/" .. rel)
+                vim.fn.bufload(buf)
+            end
+            render_diff(buf)
+            local counts = state.counts[buf] or {}
+            if (counts.changed or 0) > 0 then
+                f = f or slot(rel)
+                f.changed = true
+            end
+            if f then f.viewed = counts.viewed or 0 end
+            if temporary then api.nvim_buf_delete(buf, { force = true, unload = not created }) end
+        end
     end
 
     table.sort(order)
@@ -1172,7 +1253,7 @@ local function overview_render(P, root)
     local lines, targets, hls = {}, {}, {}
     local files, order = overview_data(root)
 
-    lines[#lines + 1] = " redline  ·  " .. (MODE_LABEL[state.mode] or state.mode)
+    lines[#lines + 1] = " redline  ·  " .. (MODE_LABEL[state.mode] or state.mode) .. " | a actions | ? help | disk stats"
     hls[#lines] = "Title"
     local gh = state.gh[root]
     if gh then
@@ -1239,7 +1320,8 @@ local function overview_render(P, root)
         for lnum, text in pairs(load_notes(root)[rel] or {}) do
             local short = text:gsub("%s+", " ")
             if #short > 34 then short = short:sub(1, 33) .. "…" end
-            lines[#lines + 1] = string.format("   󰆉 %d  %s", lnum, short)
+            lines[#lines + 1] = string.format("   󰆉 %s  %s",
+                note_label(lnum, note_end(root, rel, lnum)), short)
             hls[#lines] = "RedlineNote"
             targets[#lines] = { file = root .. "/" .. rel, line = lnum }
         end
@@ -1250,18 +1332,28 @@ local function overview_render(P, root)
 end
 
 -- The split panel is the fallback for a setup without telescope.
-function M.overview_split()
+function M.overview_split(root)
     if ov_panel.win and api.nvim_win_is_valid(ov_panel.win) then
         panel_close(ov_panel)
         return
     end
-    local root = current_root()
+    root = root or current_root()
     if not root then
         vim.notify("redline: not inside a git repository", vim.log.levels.WARN)
         return
     end
     ensure_enabled()
     panel_open(ov_panel, overview_render, root, true)
+    vim.b[ov_panel.buf].redline_root = root
+    local function selected(actions)
+        local target = ov_panel.targets[api.nvim_win_get_cursor(0)[1]]
+        if not target then return end
+        panel_close(ov_panel)
+        require("redline.workflow").open_target(root, target.file, target.line, actions)
+    end
+    vim.keymap.set("n", "<CR>", function() selected(false) end, { buffer = ov_panel.buf })
+    vim.keymap.set("n", "a", function() selected(true) end, { buffer = ov_panel.buf })
+    vim.keymap.set("n", "?", M.help, { buffer = ov_panel.buf })
 end
 
 -- One flat, fuzzy-searchable list: every changed file, and under it every PR
@@ -1293,7 +1385,8 @@ local function overview_entries(root)
         local lnums = vim.tbl_keys(notes[rel] or {})
         table.sort(lnums)
         for _, lnum in ipairs(lnums) do
-            out[#out + 1] = { kind = "note", rel = rel, line = lnum, body = notes[rel][lnum] }
+            out[#out + 1] = { kind = "note", rel = rel, line = lnum,
+                end_line = note_end(root, rel, lnum), body = notes[rel][lnum] }
         end
     end
     return out
@@ -1334,7 +1427,7 @@ local function preview_comment(e, root, width)
     local who = e.kind == "note" and "note" or ("@" .. e.author)
 
     lines[#lines + 1] = string.format("%s %s  ·  %s:%s", glyph, who, e.rel,
-        e.outdated and "outdated" or e.line)
+        e.outdated and "outdated" or note_label(e.line, e.end_line))
     hls[#lines] = e.kind == "note" and "RedlineNote" or "RedlineGh"
     lines[#lines + 1] = string.rep("─", math.min(width, 78))
     hls[#lines] = "Comment"
@@ -1357,9 +1450,9 @@ local function preview_comment(e, root, width)
             lines[#lines + 1] = "── context " .. string.rep("─", 44)
             hls[#lines] = "Comment"
             local all = vim.fn.readfile(path)
-            for i = math.max(1, e.line - 6), math.min(#all, e.line + 6) do
+            for i = math.max(1, e.line - 6), math.min(#all, (e.end_line or e.line) + 6) do
                 lines[#lines + 1] = string.format("%5d  %s", i, all[i])
-                if i == e.line then hls[#lines] = "RedlineChangeLn" end
+                if i >= e.line and i <= (e.end_line or e.line) then hls[#lines] = "RedlineChangeLn" end
             end
         end
     end
@@ -1390,7 +1483,7 @@ local function overview_previewer(root)
         dyn_title = function(_, entry)
             local e = entry.value
             if e.kind == "file" then return e.rel .. "  (diff)" end
-            return string.format("%s:%s", e.rel, e.outdated and "outdated" or e.line)
+            return string.format("%s:%s", e.rel, e.outdated and "outdated" or note_label(e.line, e.end_line))
         end,
         define_preview = function(self, entry)
             local bufnr = self.state.bufnr
@@ -1422,15 +1515,15 @@ local function overview_previewer(root)
     })
 end
 
-function M.overview()
+function M.overview(root)
     local ok_pickers, pickers = pcall(require, "telescope.pickers")
-    if not ok_pickers then return M.overview_split() end
+    if not ok_pickers then return M.overview_split(root) end
     local finders = require("telescope.finders")
     local conf = require("telescope.config").values
     local entry_display = require("telescope.pickers.entry_display")
     local ok_dev, devicons = pcall(require, "nvim-web-devicons")
 
-    local root = current_root()
+    root = root or current_root()
     if not root then
         vim.notify("redline: not inside a git repository", vim.log.levels.WARN)
         return
@@ -1473,7 +1566,7 @@ function M.overview()
             local glyph = is_note and "󰆉" or GLYPH.gh
             local hl = is_note and "RedlineNote" or "RedlineGh"
             local label = is_note
-                and string.format("  %d", e.line)
+                and ("  " .. note_label(e.line, e.end_line))
                 or string.format("  %s  @%s", e.outdated and "—" or e.line, e.author)
             local body = e.body:gsub("%s+", " ")
             ordinal = e.rel .. " " .. (e.author or "") .. " " .. body
@@ -1504,10 +1597,24 @@ function M.overview()
         sorting_strategy = "ascending",
     }, {
         prompt_title = title,
-        results_title = string.format("%d entries", #entries),
+        results_title = string.format("%d entries | Enter open | C-a / a actions | ? help | disk stats", #entries),
         finder = finders.new_table({ results = entries, entry_maker = make }),
         sorter = conf.generic_sorter({}),
         previewer = overview_previewer(root),
+        attach_mappings = function(prompt, map)
+            local actions = require("telescope.actions")
+            local function selected(menu)
+                local entry = require("telescope.actions.state").get_selected_entry()
+                if not entry then return end
+                actions.close(prompt)
+                require("redline.workflow").open_target(root, entry.filename, entry.lnum, menu)
+            end
+            actions.select_default:replace(function() selected(false) end)
+            map("i", "<C-a>", function() selected(true) end)
+            map("n", "a", function() selected(true) end)
+            map("n", "?", function() actions.close(prompt); M.help() end)
+            return true
+        end,
     }):find()
 end
 
@@ -1725,7 +1832,7 @@ local function panels_refresh()
     local root = current_root()
     if not root then return end
     if ov_panel.win and api.nvim_win_is_valid(ov_panel.win) then
-        overview_render(ov_panel, root)
+        overview_render(ov_panel, vim.b[ov_panel.buf].redline_root or root)
     end
     if gh_panel.win and api.nvim_win_is_valid(gh_panel.win) then
         gh_render(gh_panel, root)
@@ -1776,7 +1883,7 @@ end
 MODE_LABEL = {
     worktree = "uncommitted (vs HEAD)",
     commit = "latest commit (vs HEAD~1)",
-    branch = "whole branch (vs main)",
+    branch = "whole branch (vs default branch merge-base)",
 }
 
 -- One single-line echo, never two messages in a row and never wider than the
@@ -1842,153 +1949,16 @@ end
 -- help
 -- ─────────────────────────────
 
--- { key, description } pairs; a bare string is a section heading, false a gap.
-local HELP = {
-    "diff",
-    { "<leader>hh", "on: asks PR / latest commit / uncommitted.  press again: off" },
-    { "<leader>hs", "legend + counts on the message line" },
-    { "<leader>hr", "reload base rev + index (after commit / rebase / outside staging)" },
-    { "]h  [h", "jump to next / previous changed line" },
-    { "<leader>hO", "overview: telescope popup of every changed file, note and PR comment" },
-    { "", "type to filter across paths, authors and comment text; preview on the right" },
-    { "<leader>hD", "hide / show removed code (it is on whenever you open a diff)" },
-    { "<leader>hp", "read a long removed block in a float you can actually scroll" },
-    { "<leader>hU", "undo the last redline action (stage / viewed / note -- not buffer edits)" },
-    false,
-    "stage",
-    { "<leader>hS", "stage the hunk under the cursor (visual: every hunk selected)" },
-    { "<leader>hA", "stage the whole file" },
-    { "<leader>hu", "unstage the whole file" },
-    false,
-    "viewed",
-    { "<leader>hv", "mark hunk under cursor as viewed (visual: the selection)" },
-    { "<leader>hV", "clear viewed marks in this file" },
-    { "<leader>hZ", "clear viewed marks in the whole repo" },
-    false,
-    "notes  ->  " .. NOTES_FILE,
-    { "<leader>hc", "add / edit a note on this line (empty input deletes)" },
-    { "<leader>hd", "delete the note on this line" },
-    { "<leader>hl", "list every note in the repo (quickfix)" },
-    { "<leader>ho", "open .comments.txt" },
-    { "<leader>hy", "copy: removed code, PR comments or notes (asks if several apply)" },
-    { "<leader>hX", "delete all notes" },
-    false,
-    "github  ->  needs the gh CLI; on by default, fetched in the background",
-    { "<leader>hg", "PR comments off / on (on refetches)" },
-    { "<leader>hG", "open / close the comments panel on the right" },
-    { "", "in the panel: <CR> jumps, y copies the entry, Y copies all, q closes" },
-    { "<leader>hC", "comment bodies: off -> under cursor -> all (starts at 'cursor')" },
-    { ":Redline ghsync", "refetch now, and open the panel" },
-    { ":Redline commentsoff", "hide every comment body, keep the 󰊤 signs" },
-    false,
-    "colors",
-    { "GREEN", "┃  line added, not staged yet" },
-    { "BLUE", "╏  line changed, not staged yet" },
-    { "RED", "▁  lines were removed here" },
-    { "AMBER", "already in the index: staged, or committed on this branch" },
-    { "GREY", "✓  viewed; flips back the moment you edit the line" },
-    { "PURPLE", "󰆉  a note is attached to this line" },
-    { "TEAL", "󰊤  a PR review comment is attached to this line" },
-    false,
-    "commands",
-    { ":Redline", "toggle pick worktree commit branch reload refresh status legend help" },
-    { "", "deletions deloff delcursor delall notes stage stagefile unstage" },
-    { "", "undo gh ghsync ghpanel ghclear" },
-    { "", "comments commentsoff commentscursor commentsall" },
-    { "", "viewed clearviewed clearviewedall" },
-}
-
--- the colour rows paint their key cell instead of printing its name
-local SWATCH = {
-    GREEN = "RedlineAddLn",
-    BLUE = "RedlineChangeLn",
-    RED = "RedlineDeleteLn",
-    AMBER = "RedlineStagedLn",
-    GREY = "RedlineViewedLn",
-    PURPLE = "RedlineNoteLn",
-}
-
-function M.help()
-    local key_w = 0
-    for _, row in ipairs(HELP) do
-        if type(row) == "table" then key_w = math.max(key_w, #row[1]) end
-    end
-
-    local lines, marks = {}, {}
-    -- marks are { row, start_col, end_col, hl }; end_col must be a real column,
-    -- an end_row spanning trick silently drops the highlight
-    local function push(text, hl, from, to)
-        lines[#lines + 1] = text
-        if hl then
-            marks[#marks + 1] = { #lines - 1, from or 0, to or #text, hl }
-        end
-    end
-
-    push("  redline -- " .. MODE_LABEL[state.mode], "Title")
-    push("")
-
-    for _, row in ipairs(HELP) do
-        if row == false then
-            push("")
-        elseif type(row) == "string" then
-            push("  " .. row, "Special")
-        else
-            local key = row[1]
-            local pad = string.rep(" ", key_w - #key)
-            local text = string.format("    %s%s   %s", key, pad, row[2])
-            push(text, "Comment", 4 + #key + #pad + 3, #text)
-            -- the colour rows show the actual highlight in place of a key name
-            marks[#marks + 1] = { #lines - 1, 4, 4 + #key, SWATCH[key] or "RedlineNote" }
-        end
-    end
-    push("")
-    push("  q / <Esc> to close", "Comment")
-
-    local width = 0
-    for _, l in ipairs(lines) do width = math.max(width, vim.fn.strdisplaywidth(l)) end
-    width = math.min(width + 2, vim.o.columns - 4)
-    local height = math.min(#lines, vim.o.lines - 6)
-
-    local buf = api.nvim_create_buf(false, true)
-    api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-
-    local ns_help = api.nvim_create_namespace("redline_help")
-    for _, m in ipairs(marks) do
-        pcall(api.nvim_buf_set_extmark, buf, ns_help, m[1], m[2], { end_col = m[3], hl_group = m[4] })
-    end
-
-    vim.bo[buf].modifiable = false
-    vim.bo[buf].buftype = "nofile"
-    vim.bo[buf].bufhidden = "wipe"
-
-    local win = api.nvim_open_win(buf, true, {
-        relative = "editor",
-        width = width,
-        height = height,
-        row = math.floor((vim.o.lines - height) / 2) - 1,
-        col = math.floor((vim.o.columns - width) / 2),
-        style = "minimal",
-        border = "rounded",
-        title = " redline ",
-        title_pos = "center",
-    })
-    vim.wo[win].cursorline = false
-
-    for _, k in ipairs({ "q", "<Esc>", "<CR>" }) do
-        vim.keymap.set("n", k, function()
-            if api.nvim_win_is_valid(win) then api.nvim_win_close(win, true) end
-        end, { buffer = buf, nowait = true })
-    end
-end
+function M.help() require("redline.workflow").help() end
 
 -- ─────────────────────────────
 -- staging
 -- ─────────────────────────────
 
 -- Which index->buffer hunks touch [first, last] in buffer coordinates.
-local function hunks_in_range(bufnr, first, last)
+local function hunks_in_range(hunks, first, last, visual)
     local out = {}
-    for _, h in ipairs(state.index_hunks[bufnr] or {}) do
+    for _, h in ipairs(hunks) do
         local sb, cb = h[3], h[4]
         local lo, hi
         if cb == 0 then
@@ -1996,29 +1966,52 @@ local function hunks_in_range(bufnr, first, last)
         else
             lo, hi = sb, sb + cb - 1
         end
-        if lo <= last and hi >= first then out[#out + 1] = h end
+        if lo <= last and hi >= first and not (visual and cb == 0) then out[#out + 1] = h end
     end
     return out
 end
 
--- A zero-context unified diff against the index, which `git apply --cached
--- --unidiff-zero` can stage without touching the rest of the file.
-local function build_patch(rel, old_lines, new_lines, hunks)
-    local out = {
-        "diff --git a/" .. rel .. " b/" .. rel,
-        "--- a/" .. rel,
-        "+++ b/" .. rel,
-    }
-    for _, h in ipairs(hunks) do
-        local sa, ca, sb, cb = h[1], h[2], h[3], h[4]
-        out[#out + 1] = string.format("@@ -%d,%d +%d,%d @@", sa, ca, sb, cb)
-        for i = sa, sa + ca - 1 do out[#out + 1] = "-" .. (old_lines[i] or "") end
-        for i = sb, sb + cb - 1 do out[#out + 1] = "+" .. (new_lines[i] or "") end
+-- Construct the desired index text, then let xdiff handle patch coordinates and
+-- missing-newline markers. Keep line endings attached while splicing.
+local function build_patch(rel, old, new, hunks, first, last, mode)
+    local function lines(text)
+        local out = {}
+        for line in text:gmatch("[^\n]*\n?") do
+            if line ~= "" then out[#out + 1] = line end
+        end
+        return out
     end
-    return table.concat(out, "\n") .. "\n"
+    local target, source = lines(old), lines(new)
+    for n = #hunks, 1, -1 do
+        local h = hunks[n]
+        local sa, ca, sb, cb = h[1], h[2], h[3], h[4]
+        local lo, hi = 0, cb - 1
+        if first then lo, hi = math.max(0, first - sb), math.min(cb - 1, last - sb) end
+        -- Pair replacement lines by offset. Only selecting the entire new side
+        -- removes surplus old lines; a partial selection leaves those untouched.
+        local offset = math.min(lo, ca)
+        local count = math.max(0, math.min(hi + 1, ca) - offset)
+        if lo == 0 and hi == cb - 1 then count = ca end
+        local at = (ca == 0 and sa or sa - 1) + offset
+        for _ = 1, count do table.remove(target, at + 1) end
+        for i = hi, lo, -1 do table.insert(target, at + 1, source[sb + i]) end
+    end
+    -- A retained unterminated EOF line needs a separator if we append after it.
+    for i = 1, #target - 1 do
+        if target[i]:sub(-1) ~= "\n" then target[i] = target[i] .. "\n" end
+    end
+    local body = vim.diff(old, table.concat(target), { result_type = "unified", ctxlen = 0 })
+    if body == "" then return nil end
+    local function quote(path)
+        return '"' .. path:gsub('[^%w/._-]', function(c) return string.format("\\%03o", c:byte()) end) .. '"'
+    end
+    local a, b = quote("a/" .. rel), quote("b/" .. rel)
+    return "diff --git " .. a .. " " .. b .. "\n"
+        .. (mode and "new file mode " .. mode .. "\n" or "")
+        .. "--- " .. (mode and "/dev/null" or a) .. "\n+++ " .. b .. "\n" .. body
 end
 
--- Stage the hunk under the cursor, or every hunk the visual selection touches.
+-- Stage the cursor hunk, or only selected added/replacement buffer lines.
 -- Staged content comes from the buffer, so what you see marked is what lands in
 -- the index even if the file is not written yet.
 function M.stage(first, last)
@@ -2032,40 +2025,46 @@ function M.stage(first, last)
     local rel = relpath(root, bufnr)
     if not rel then return end
 
-    if not first then
+    local visual = first ~= nil
+    if visual then
+        last = last or first
+        if type(first) ~= "number" or type(last) ~= "number"
+            or first % 1 ~= 0 or last % 1 ~= 0 then return end
+        first, last = math.min(first, last), math.max(first, last)
+    else
         first = api.nvim_win_get_cursor(0)[1]
         last = first
     end
 
-    local hunks = hunks_in_range(bufnr, first, last)
+    local snap = index_entry(root, rel)
+    local old = ""
+    if snap then
+        -- Read the snapshot blob, not the rendering cache (external staging and
+        -- buffer edits can both have happened since the last render).
+        local blob = vim.system({ "git", "-C", root, "cat-file", "blob", snap.sha }):wait()
+        if blob.code ~= 0 then return end
+        old = blob.stdout
+    end
+    local new = buf_text(bufnr)
+    local hunks = hunks_in_range(vim.diff(old, new,
+        { result_type = "indices", algorithm = "histogram" }), first, last, visual)
     if #hunks == 0 then
         M.legend("nothing unstaged here")
         return
     end
 
-    local snap = index_entry(root, rel)
-
-    -- untracked file: there is no index blob to patch against, just add it
-    local tracked = git(root, { "ls-files", "--error-unmatch", "--", rel }) ~= nil
-    if not tracked then
-        if vim.bo[bufnr].modified then vim.cmd("silent write") end
-        if git(root, { "add", "--", rel }) == nil then
-            vim.notify("redline: git add failed", vim.log.levels.ERROR)
-            return
-        end
-    else
-        local patch = build_patch(rel,
-            split(index_text(bufnr, root, rel)),
-            api.nvim_buf_get_lines(bufnr, 0, -1, false),
-            hunks)
-
-        local res = vim.system(
-            { "git", "-C", root, "apply", "--cached", "--unidiff-zero", "--whitespace=nowarn", "-" },
-            { stdin = patch, text = true }):wait()
-        if res.code ~= 0 then
-            vim.notify("redline: staging failed\n" .. (res.stderr or ""), vim.log.levels.ERROR)
-            return
-        end
+    local mode
+    if not snap then
+        mode = vim.fn.executable(api.nvim_buf_get_name(bufnr)) == 1 and "100755" or "100644"
+    end
+    local patch = build_patch(rel, old, new, hunks, visual and first or nil, last, mode)
+    if not patch then M.legend("nothing unstaged here"); return end
+    local res = vim.system(
+        { "git", "-C", root, "apply", "--cached", "--unidiff-zero", "--whitespace=nowarn", "-" },
+        { stdin = patch, text = true }):wait()
+    if res.code ~= 0 then
+        vim.notify("redline: staging failed\n" .. (res.stderr or ""), vim.log.levels.ERROR)
+        return
     end
 
     push_undo(string.format("stage %d hunk%s in %s", #hunks, #hunks == 1 and "" or "s", rel), function()
@@ -2077,7 +2076,7 @@ function M.stage(first, last)
     state.index[bufnr] = nil
     render_diff(bufnr)
     panels_refresh()
-    M.legend(string.format("staged %d hunk%s", #hunks, #hunks == 1 and "" or "s"))
+    M.legend(visual and "staged selected lines" or string.format("staged %d hunk%s", #hunks, #hunks == 1 and "" or "s"))
 end
 
 function M.stage_file()
@@ -2152,8 +2151,20 @@ function M.toggle_viewed(first, last)
     local rel = relpath(root, bufnr)
     if not rel then return end
 
+    render_diff(bufnr)
     if not first then
         first, last = hunk_at(bufnr, api.nvim_win_get_cursor(0)[1])
+    end
+
+    last = last or first
+    local candidates = viewed_candidates[bufnr] or {}
+    local selected = {}
+    for i, c in ipairs(candidates) do
+        if c[1] >= first and c[1] <= last then selected[#selected + 1] = i end
+    end
+    if #selected == 0 then
+        M.legend("no changed lines selected")
+        return
     end
 
     local v = load_viewed()
@@ -2162,17 +2173,19 @@ function M.toggle_viewed(first, last)
     local seen = v[root][rel]
     local snap = vim.deepcopy(seen)
 
-    local lines = api.nvim_buf_get_lines(bufnr, first - 1, last, false)
-    local hashes = {}
+    local snapshot = vim.fn.sha256(buf_text(bufnr))
+    local matches = viewed_helpers.match(bufnr, seen, candidates, snapshot)
     local all_seen = true
-    for _, l in ipairs(lines) do
-        local h = line_hash(l)
-        hashes[#hashes + 1] = h
-        if not seen[h] then all_seen = false end
+    for _, i in ipairs(selected) do
+        if not matches[i] then all_seen = false end
     end
 
-    for _, h in ipairs(hashes) do
-        seen[h] = (not all_seen) and true or nil
+    for _, i in ipairs(selected) do
+        if all_seen then
+            seen[matches[i]] = nil
+        elseif not matches[i] then
+            viewed_helpers.add(bufnr, seen, candidates[i], snapshot)
+        end
     end
     if next(seen) == nil then v[root][rel] = nil end
     if next(v[root]) == nil then v[root] = nil end
@@ -2190,7 +2203,7 @@ function M.toggle_viewed(first, last)
     render_diff(bufnr)
     panels_refresh()
     M.legend(string.format("%d line%s %s viewed",
-        #hashes, #hashes == 1 and "" or "s", all_seen and "un-marked" or "marked"))
+        #selected, #selected == 1 and "" or "s", all_seen and "un-marked" or "marked"))
 end
 
 function M.clear_viewed(all_files)
@@ -2228,18 +2241,18 @@ end
 
 -- One key does the whole job: pick what you are reviewing and it turns on with
 -- removed code already visible, instead of hh then hm then hD.
-local PICK = {
-    { mode = "branch", label = "PR diff        vs main" },
-    { mode = "commit", label = "Latest commit  vs HEAD~1" },
-    { mode = "worktree", label = "Uncommitted    vs HEAD" },
-}
-
 function M.pick()
-    if not get_root(api.nvim_get_current_buf()) then
+    local root = current_root()
+    if not root then
         vim.notify("redline: not inside a git repository", vim.log.levels.WARN)
         return
     end
-    vim.ui.select(PICK, {
+    local ref = default_branch(root)
+    vim.ui.select({
+        { mode = "worktree", label = "Uncommitted vs HEAD" },
+        { mode = "commit", label = "Latest commit + uncommitted vs HEAD~1" },
+        { mode = "branch", label = "Branch / PR diff vs " .. (ref or "default branch unavailable (falls back to HEAD)") },
+    }, {
         prompt = "redline: what do you want to see?",
         format_item = function(item) return item.label end,
     }, function(choice)
@@ -2248,8 +2261,21 @@ function M.pick()
         -- momentary "get out of my way", not a preference worth remembering
         -- across a restart or the next time you open the diff.
         state.show_deleted = state.deletions_default
+        state.base, state.index, state.rev = {}, {}, {}
         M.set_mode(choice.mode)
+        M.overview(root)
     end)
+end
+
+M.open = M.pick
+function M.actions(first, last) require("redline.workflow").actions(first, last) end
+function M.diff() require("redline.workflow").diff() end
+-- Narrow bridge for the workflow UI; stores and mutations stay in this module.
+function M.workflow_context(root)
+    root = root or current_root()
+    if not root then return end
+    return { root = root, base = base_rev(root), mode = state.mode,
+        default_branch = default_branch(root), github = state.gh_enabled }
 end
 
 -- hh is the only entry point: it asks the question on the press that turns the
@@ -2408,7 +2434,7 @@ function M.next_hunk(backwards)
     vim.cmd("normal! zz")
 end
 
-function M.add_note()
+function M.add_note(first, last)
     -- notes are part of the same overlay, so jotting one switches it on
     ensure_enabled()
     local bufnr = api.nvim_get_current_buf()
@@ -2421,25 +2447,66 @@ function M.add_note()
     if not rel then return end
 
     local lnum = api.nvim_win_get_cursor(0)[1]
-    local _, existing = note_at_cursor(bufnr, lnum)
+    local explicit = first ~= nil
+    local id, existing, note_first, note_last = note_at_cursor(bufnr, lnum)
+    if explicit then
+        last = last or first
+        if type(first) ~= "number" or type(last) ~= "number"
+            or first % 1 ~= 0 or last % 1 ~= 0 then
+            vim.notify("redline: note range must contain integer line numbers", vim.log.levels.WARN)
+            return
+        end
+        first, last = math.min(first, last), math.max(first, last)
+        local total = api.nvim_buf_line_count(bufnr)
+        first, last = math.max(1, math.min(total, first)), math.max(1, math.min(total, last))
+        id, existing, note_first, note_last = note_at_cursor(bufnr, first)
+        if note_first ~= first then id, existing = nil, nil end
+    elseif id then
+        first, last = note_first, note_last
+    else
+        first, last = lnum, lnum
+        -- Recompute the actual review diff, including unsaved edits. Adjacent
+        -- painted lines can belong to distinct hunks (especially deletions).
+        for _, h in ipairs(vim.diff(base_text(bufnr, root, rel), buf_text(bufnr),
+            { result_type = "indices", algorithm = "histogram" }) or {}) do
+            local lo = math.max(1, h[3])
+            local hi = lo + math.max(1, h[4]) - 1
+            if lnum >= lo and lnum <= hi then first, last = lo, hi break end
+        end
+    end
 
-    vim.ui.input({ prompt = "note (empty = delete): ", default = existing or "" }, function(input)
+    vim.ui.input({ prompt = "note " .. note_label(first, last) .. " (empty = delete): ",
+        default = existing or "" }, function(input)
         if input == nil then return end
+        if not api.nvim_buf_is_valid(bufnr) then return end
+        if id then
+            local pos = api.nvim_buf_get_extmark_by_id(bufnr, ns_note, id, { details = true })
+            if #pos == 0 then return end
+            local total = api.nvim_buf_line_count(bufnr)
+            local moved = math.min(total, pos[1] + 1)
+            if not explicit then last = math.max(moved, math.min(total, pos[3].end_row or moved)) end
+            first = moved
+        end
         -- positions of other notes in this buffer may have drifted; capture
         -- them before rewriting the file
         sync_notes(bufnr)
         local notes = load_notes(root)
         local snap = vim.deepcopy(notes[rel])
+        local range_snap = vim.deepcopy(note_ranges[root][rel])
         notes[rel] = notes[rel] or {}
-        notes[rel][lnum] = nil
+        note_ranges[root][rel] = note_ranges[root][rel] or {}
+        notes[rel][first] = nil
+        note_ranges[root][rel][first] = nil
         if vim.trim(input) ~= "" then
-            notes[rel][lnum] = vim.trim(input)
+            notes[rel][first] = vim.trim(input):gsub("[\r\n]+", " ")
+            note_ranges[root][rel][first] = last
         end
         if next(notes[rel]) == nil then notes[rel] = nil end
         write_notes(root, { [rel] = true })
         panels_refresh()
-        push_undo("note on " .. rel .. ":" .. lnum, function()
+        push_undo("note on " .. rel .. ":" .. note_label(first, last), function()
             load_notes(root)[rel] = snap
+            note_ranges[root][rel] = range_snap
             write_notes(root, { [rel] = true })
             render_notes(bufnr)
         end)
@@ -2457,18 +2524,22 @@ function M.del_note()
     if not rel then return end
 
     local lnum = api.nvim_win_get_cursor(0)[1]
+    local _, _, first = note_at_cursor(bufnr, lnum)
     sync_notes(bufnr)
     local notes = load_notes(root)
-    if not notes[rel] or not notes[rel][lnum] then
+    if not first or not notes[rel] or not notes[rel][first] then
         M.legend("no note on this line")
         return
     end
     local snap = vim.deepcopy(notes[rel])
-    notes[rel][lnum] = nil
+    local range_snap = vim.deepcopy(note_ranges[root][rel])
+    notes[rel][first] = nil
+    note_ranges[root][rel][first] = nil
     if next(notes[rel]) == nil then notes[rel] = nil end
     write_notes(root, { [rel] = true })
     push_undo("delete note on " .. rel .. ":" .. lnum, function()
         load_notes(root)[rel] = snap
+        note_ranges[root][rel] = range_snap
         write_notes(root, { [rel] = true })
         render_notes(bufnr)
     end)
@@ -2484,7 +2555,8 @@ function M.list_notes()
     local items = {}
     for rel, lines in pairs(load_notes(root)) do
         for lnum, text in pairs(lines) do
-            items[#items + 1] = { filename = root .. "/" .. rel, lnum = lnum, text = text }
+            items[#items + 1] = { filename = root .. "/" .. rel, lnum = lnum,
+                end_lnum = note_end(root, rel, lnum), text = text }
         end
     end
     if #items == 0 then
@@ -2505,10 +2577,13 @@ function M.clear_notes()
     if not root then return end
     if vim.fn.confirm("Delete all notes in " .. NOTES_FILE .. "?", "&Yes\n&No", 2) ~= 1 then return end
     local snap = vim.deepcopy(load_notes(root))
+    local range_snap = vim.deepcopy(note_ranges[root])
     state.notes[root] = {}
+    note_ranges[root] = {}
     write_notes(root)
     push_undo("clear all notes", function()
         state.notes[root] = snap
+        note_ranges[root] = range_snap
         write_notes(root)
         for _, b in ipairs(api.nvim_list_bufs()) do
             if api.nvim_buf_is_loaded(b) then render_notes(b) end
@@ -2861,6 +2936,14 @@ function M.setup(opts)
             sync_notes(e.buf)
             state.index[e.buf] = nil
             refresh(e.buf, true)
+            if state.enabled and state.viewed then
+                local root = get_root(e.buf)
+                local rel = root and relpath(root, e.buf)
+                if rel and (state.viewed[root] or {})[rel] then
+                    -- Persist positions validated by refresh, not every render.
+                    save_viewed()
+                end
+            end
         end,
     })
 
@@ -2874,6 +2957,11 @@ function M.setup(opts)
             state.index = {}
             refresh(api.nvim_get_current_buf(), true)
         end,
+    })
+
+    api.nvim_create_autocmd("BufUnload", {
+        group = group,
+        callback = function(e) viewed_helpers.unload(e.buf) end,
     })
 
     api.nvim_create_autocmd({ "BufDelete", "BufWipeout" }, {
@@ -2893,8 +2981,11 @@ function M.setup(opts)
     })
 
     api.nvim_create_user_command("Redline", function(a)
-        local sub = a.args ~= "" and a.args or "status"
+        local sub = a.args ~= "" and a.args or "open"
         local actions = {
+            open = M.open,
+            actions = M.actions,
+            diff = M.diff,
             toggle = M.toggle,
             pick = M.pick,
             undo = M.undo,
@@ -2936,55 +3027,35 @@ function M.setup(opts)
     end, {
         nargs = "?",
         complete = function()
-            return { "toggle", "pick", "worktree", "commit", "branch", "reload", "refresh", "status", "legend", "help", "notes",
-                "deletions", "deloff", "delcursor", "delall",
-                "stage", "stagefile", "unstage", "viewed", "clearviewed", "clearviewedall",
-                "undo", "gh", "ghsync", "ghpanel", "ghclear",
-                "comments", "commentsoff", "commentscursor", "commentsall", "overview", "overviewsplit" }
+            return { "open", "actions", "diff", "help" }
         end,
     })
 
-    local map = vim.keymap.set
-    map("n", "<leader>hh", M.toggle, { desc = "Diff: line marks on (asks what to diff) / off" })
-    map("n", "<leader>hr", M.reload, { desc = "Diff: reload base + index" })
-    map("n", "<leader>hs", M.legend, { desc = "Diff: legend + counts" })
-    map("n", "<leader>h?", M.help, { desc = "Diff: help -- every redline mapping" })
-    map("n", "]h", function() M.next_hunk(false) end, { desc = "Diff: next changed line" })
-    map("n", "[h", function() M.next_hunk(true) end, { desc = "Diff: prev changed line" })
-    map("n", "<leader>hp", M.peek, { desc = "Diff: read the removed block in a float" })
-    map("n", "<leader>hD", M.toggle_deleted, { desc = "Diff: hide / show removed code" })
-
-    map("n", "<leader>hS", function() M.stage() end, { desc = "Stage: hunk under cursor" })
-    map("x", "<leader>hS", function()
-        local a, b = visual_range()
-        vim.cmd("normal! \27")
-        M.stage(a, b)
-    end, { desc = "Stage: hunks in selection" })
-    map("n", "<leader>hA", M.stage_file, { desc = "Stage: whole file" })
-    map("n", "<leader>hu", M.unstage_file, { desc = "Stage: unstage whole file" })
-
-    map("n", "<leader>hv", function() M.toggle_viewed() end, { desc = "Viewed: toggle hunk under cursor" })
-    map("x", "<leader>hv", function()
-        local a, b = visual_range()
-        vim.cmd("normal! \27")
-        M.toggle_viewed(a, b)
-    end, { desc = "Viewed: toggle selection" })
-    map("n", "<leader>hV", function() M.clear_viewed(false) end, { desc = "Viewed: clear in this file" })
-    map("n", "<leader>hZ", function() M.clear_viewed(true) end, { desc = "Viewed: clear in whole repo" })
-
-    map("n", "<leader>hc", M.add_note, { desc = "Note: add/edit on this line" })
-    map("n", "<leader>hd", M.del_note, { desc = "Note: delete on this line" })
-    map("n", "<leader>hl", M.list_notes, { desc = "Note: list all (quickfix)" })
-    map("n", "<leader>ho", M.open_notes, { desc = "Note: open .comments.txt" })
-    map("n", "<leader>hy", M.yank, { desc = "Copy: removed code / PR comments / notes" })
-    map("n", "<leader>hX", M.clear_notes, { desc = "Note: clear all" })
-
-    map("n", "<leader>hg", M.gh_toggle, { desc = "GitHub: PR comments on / off" })
-    map("n", "<leader>hG", M.gh_panel, { desc = "GitHub: toggle the comments panel" })
-    map("n", "<leader>hC", M.cycle_comments, { desc = "GitHub: cycle comment bodies off/cursor/all" })
-    map("n", "<leader>hO", M.overview, { desc = "Diff: overview of every changed file" })
-
-    map("n", "<leader>hU", M.undo, { desc = "Diff: undo the last redline action" })
+    if opts.keymaps ~= false then
+        local map = vim.keymap.set
+        map("n", "<leader>ho", M.open, { desc = "Redline: choose review context and overview" })
+        map("n", "<leader>ha", M.actions, { desc = "Redline: actions" })
+        map("x", "<leader>ha", function()
+            local a, b = visual_range()
+            vim.cmd("normal! \27")
+            M.actions(a, b)
+        end, { desc = "Redline: selection actions" })
+        map("n", "<leader>h?", M.help, { desc = "Redline: help" })
+        map("n", "]h", function() M.next_hunk(false) end, { desc = "Diff: next changed line" })
+        map("n", "[h", function() M.next_hunk(true) end, { desc = "Diff: prev changed line" })
+        map("n", "<leader>hv", function() M.toggle_viewed() end, { desc = "Viewed: toggle hunk under cursor" })
+        map("x", "<leader>hv", function()
+            local a, b = visual_range()
+            vim.cmd("normal! \27")
+            M.toggle_viewed(a, b)
+        end, { desc = "Viewed: toggle selection" })
+        map("n", "<leader>hc", M.add_note, { desc = "Note: add/edit on this line" })
+        map("x", "<leader>hc", function()
+            local a, b = visual_range()
+            vim.cmd("normal! \27")
+            M.add_note(a, b)
+        end, { desc = "Note: add/edit selection" })
+    end
 
     if state.enabled then refresh(api.nvim_get_current_buf(), true) end
 end
