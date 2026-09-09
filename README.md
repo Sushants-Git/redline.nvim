@@ -1,232 +1,181 @@
 # redline.nvim
 
-**Review a diff without leaving the file.** Gitsigns marks the gutter; redline paints the
-whole line, shows you the code that was removed, pulls in the PR's review comments, and keeps
-track of what you have already read.
-
-```
-  ┃ a line you added                            green
-  ╏ a line you changed                          blue
-  ▁ old text                                    red, drawn where it was deleted
-  ┃ a line already in the index                 amber — staged, or committed on this branch
-  ✓ a line you have ticked off                  grey, un-ticks itself the moment you edit it
-  󰆉 a note you left for an agent                purple
-  󰊤 a review comment from the PR                teal
-```
-
-Everything is off until you ask for it. While disabled the plugin does not run a single git
-command.
+**Review a diff without leaving the file.** Redline paints changed lines, shows
+removed code, brings in PR review comments, and tracks what you have read.
+The overlay uses live buffers, including unsaved edits.
 
 ## Install
 
-lazy.nvim:
+Requires Neovim 0.10+ and Git. With lazy.nvim:
 
 ```lua
 { "Sushants-Git/redline.nvim", event = "VeryLazy", cmd = "Redline", opts = {} }
 ```
 
-Optional: `nvim-telescope/telescope.nvim` and `nvim-tree/nvim-web-devicons` give you the
-fuzzy overview; without them the overview falls back to a split panel. `gh` (the GitHub CLI,
-logged in) is needed for PR comments and PR creation/opening; local review works without it.
+Optional: `nvim-telescope/telescope.nvim` for the native action picker and fuzzy
+file overview; `nvim-tree/nvim-web-devicons` for overview icons. Without Telescope,
+actions use `vim.ui.select` and the overview uses a split. GitHub features require
+the logged-in `gh` CLI; local review works without it.
 
-## Getting started
+## Review
 
-`<leader>ho` (Space ho when your leader is Space) or `:Redline` asks what you want to review:
+`<leader>ho` or `:Redline` chooses a context, enables the overlay, and opens files:
 
-```
-1. Uncommitted    vs HEAD
-2. Latest commit + uncommitted vs HEAD~1
-3. Branch / PR diff vs <actual default branch>
-```
-
-Pick a context and the overview opens with the overlay enabled, removed code included.
-In Telescope, Enter opens the selected file; Ctrl-a (or normal-mode `a`) closes the picker,
-opens that file, then offers contextual actions. Normal-mode `?` opens help.
-The split fallback uses Enter, `a`, `?`, and `q`. Deleted/missing files open the searchable
-disk diff instead of an empty editable file; file mutations are unavailable there.
-
-`<leader>ha` opens actions. `<leader>h?` shows the current compact help.
-
-### Default keys
-
-| key | action |
-| --- | --- |
-| `<leader>ho` | choose context, then overview |
-| `<leader>ha` | actions, normal or visual |
-| `<leader>hc` | add/edit note, normal or visual (`add_note(first, last)`) |
-| `<leader>hv` | toggle viewed, normal or visual |
-| `]h` / `[h` | next / previous hunk |
-| `<leader>h?` | help |
-
-Set `keymaps = false` to install no default mappings. Redline does not set your leader.
-Staging, unstaging, notes, peek, refresh, settings, undo, copying and GitHub operations
-live in the action menu instead of separate default shortcuts.
-
-### Search and handoff
-
-`:Redline diff` opens a read-only scratch diff. Use normal `/`, `n`, and `N` to search
-added and removed text, and `q` to close. It includes untracked disk files and preserves
-Git's no-final-newline markers. It is clearly labeled a **disk snapshot**: unsaved buffer
-edits are excluded, unlike the live overlay. Overview statistics also come from disk.
-
-The **Copy AI handoff** action confirms before copying saved `.comments.txt` notes,
-review context, base and the disk diff to the unnamed register and available clipboard.
-It is provider-neutral and never runs an agent. Review for secrets before sharing.
-
-### Publish explicitly
-
-Actions include **Commit staged changes**, **Push branch**, **Create PR**, and **Open PR**.
-Commit asks for a message and confirmation of the staged summary; it never stages files.
-Push asks for a remote, destination branch and confirmation, without force.
-PR creation asks for title, body, base, draft/ready status and final confirmation.
-It uses an explicit head branch and never pushes: push separately first.
-Network operations run asynchronously with argv arrays, not interpolated shell commands.
-Commit, push and PR creation are not part of Redline undo. `github = false` disables PR actions.
-
-## What each mode diffs against
-
-| mode | base | what you see |
+| Context | Base | Includes |
 | --- | --- | --- |
-| PR diff | merge-base with the default branch | the whole branch: committed work *and* uncommitted edits |
-| Latest commit | `HEAD~1` | your last commit, plus anything dirty on top of it |
-| Uncommitted | `HEAD` | only what you have not committed |
+| Uncommitted | `HEAD` | uncommitted changes |
+| Latest commit | `HEAD~1` | latest commit plus uncommitted changes |
+| Branch / PR diff | merge-base with the default branch | committed branch work plus uncommitted changes |
 
-The default branch is read from `git symbolic-ref refs/remotes/origin/HEAD` — whatever your
-repo actually uses, not a guess at `main`. On the default branch itself the merge-base *is*
-`HEAD`, so PR mode would show nothing; redline says so once instead of rendering an empty
-diff.
+The default branch is detected from `origin/HEAD`, with main/master fallbacks.
+If the merge-base is `HEAD`, branch mode shows only uncommitted work. The first
+commit uses the empty tree in Latest commit mode.
 
-## Review Actions
+In the Telescope **file overview**, Enter opens a file; Ctrl-a or normal `a`
+opens it and then offers actions; normal `?` opens help. The split uses Enter,
+`a`, `?`, and `q`. Missing/deleted files open the read-only repo disk diff, not an
+empty editable file; file mutations are unavailable there. Overview diff stats
+come from disk, not unsaved buffers.
 
-### stage
+### Default Keys
 
-Use actions to stage the cursor hunk, visual selection, or whole file, or to unstage
-the file. Staging and unstaging ask for confirmation.
+| Key | Normal mode | Visual mode |
+| --- | --- | --- |
+| `<leader>ho` | choose context, then files | |
+| `<leader>ha` | actions for the whole file | actions for selected lines |
+| `<leader>hc` | add/edit a whole-file note | add/edit a selection note |
+| `<leader>hv` | toggle viewed for changed lines in the whole file | toggle viewed for selected changed lines |
+| `]h` / `[h` | next / previous changed location | |
+| `<leader>h?` | help | |
 
-Staged content comes from the buffer, so what you see marked is what lands in the index even
-if the file is not written yet.
+Redline does not set your leader. Set `keymaps = false` to disable default maps.
+Selections are line-based, including characterwise and blockwise selections.
 
-Visual staging includes only selected added or replacement lines, including in
-untracked files, without writing the buffer. Replacements pair old and new lines
-by position within each fresh index hunk; unselected old lines remain. Surplus
-deleted lines in a replacement stage only when its entire new side is selected.
-Pure deletions have no buffer lines to select: use **Stage hunk** at the deletion
-anchor (normal cursor staging always stages the whole hunk), or stage the file.
-Selections are line-based, even when made characterwise or blockwise.
+## Actions
 
-### viewed
+`<leader>ha` opens a **native Telescope picker in Normal mode**, with visible
+`[letter]` shortcuts. Press a letter to run immediately, or `/` to enter fuzzy
+search and Enter to run the selected row. Esc closes in either mode; normal `q`
+also closes. `/` searches actions; it does not open the diff.
 
-Use `<leader>hv` or **Toggle viewed** in actions for the hunk or selection.
+| Key | Scope | Action |
+| --- | --- | --- |
+| `s` | selection, otherwise file | stage |
+| `u` | selection, otherwise file | unstage |
+| `c` | selection, otherwise file | add/edit comment (local note) |
+| `v` | selection, otherwise file | toggle viewed |
+| `y` | selection, otherwise file | copy live buffer lines |
+| `h` | file, at cursor | select review chunk |
+| `f` | repo | file overview |
+| `d` | repo | searchable disk diff |
+| `n` | repo | saved notes |
+| `a` | whole repo | copy AI handoff: saved notes + disk diff |
+| `C` | repo index | commit staged changes |
+| `P` | repo branch | push |
+| `p` | repo | open PR or creation form in browser |
+| `z` | session, not just this file/repo | undo last Redline action, excluding publishing |
 
-Viewed marks track individual changed-line occurrences, so identical blank lines or code
-do not share marks. Positions follow edits in an open buffer; changed content invalidates
-the mark. Saved marks restore only when the file snapshot matches. External changes may
-require reviewing again rather than risk marking the wrong occurrence. Legacy text-only
-marks are discarded on upgrade. Viewed history never adds unchanged files to the overview.
+Local actions, code copy, handoff, and undo have **no confirmation step**. Comment
+asks for note text; empty input deletes the note at that range's start.
 
-### github
+To act on a chunk, put the cursor inside it, open `<leader>ha`, press `h`, then
+open **Visual `<leader>ha`** and choose an action. `h` only selects; it does not
+stage or comment. Normal `<leader>hc` and `<leader>hv` still target the whole file,
+not the chunk under the cursor.
 
-Settings offers GitHub comment toggling, syncing, and comment body visibility.
+### Staging Limits
 
-Comments are fetched **automatically** in the background the first time you open a diff in a
-repo, with one automatic fetch attempt per repo per session, never blocking, with a spinner. A
-repo with no PR is silent, not an error. Settings offers the off switch.
+Both file and selection staging use the **live buffer without saving it**.
+Selection staging includes only selected added/replacement lines, even in
+untracked files. Replacements pair old/new lines by position in fresh index
+hunks; unselected old lines remain. Surplus removed lines stage only when the
+entire replacement's new side is selected.
 
-Comments ride on extmarks, so they drift with your edits like everything else. A comment
-whose line has since changed comes back from the API with no line number; it is kept and
-shown as outdated rather than dropped.
+Whole-file staging applies Git's path-specific clean conversion (including
+`.gitattributes` filters/LFS) and records executable-bit changes when
+`core.fileMode` is enabled. Ignored untracked files are refused in both scopes.
+Partial staging refuses filtered/encoded files or patches requiring clean
+conversion; use whole-file staging instead. Neither scope saves the buffer.
 
-### notes
+Selected unstage maps live lines back to the index. If the selection overlaps
+an unstaged replacement, that mapping is ambiguous: Redline refuses the action
+without changing the index and asks you to use whole-file unstage. Newly inserted
+unstaged lines have no index counterpart. Unstage leaves the buffer and disk alone.
 
-Use `<leader>hc` to add/edit a note, or actions to add/edit, delete, and read notes.
+Pure deletions are virtual text, not selectable buffer lines. `h` cannot select
+them, and selected stage/unstage cannot target them. Use normal `<leader>ha`
+then `s` or `u` for the whole existing file. An entirely missing/deleted file is
+read-only in this workflow; handle its index changes with Git outside this menu.
 
-Notes live in `<repo>/.comments.txt` as `path:line: text` or `path:start-end: text`.
-Normal `<leader>hc` comments the current chunk, or edits the note under the cursor;
-visual `<leader>hc` comments the selected lines. Range endpoints follow buffer edits
-and update on save. Legacy single-line notes still load. Deletion-only chunks attach
-to a surviving line; one note can exist per start line. Concurrent instances preserve
-other paths' notes, but simultaneous edits to the same path are last-writer-wins.
+### Publishing
 
-### copy
+`C` shows the repo's staged summary and asks **only for a commit message**. It
+commits the entire repo index, never auto-stages, and adds no confirmation dialog.
 
-**Copy contextual code/comments** offers whatever applies where you are standing:
+`P` pushes `HEAD` only to the same branch name. If the current branch tracks a
+different name (for example, `topic` tracks `origin/main`), it refuses to push;
+configure a matching upstream with Git first. Remote selection honors
+`branch.<name>.pushRemote`, then `remote.pushDefault`, then `branch.<name>.remote`.
+Without that configuration, it uses the sole remote or asks which remote when
+several exist. It does not ask for a destination or confirmation and never
+force-pushes.
 
-```
-Removed code here  (3 lines)
-All removed code in this file  (10 lines)
-PR comment on this line
-PR comments in this file  (1)
-All PR comments on #412  (7)
-Notes  (.comments.txt)
-```
+The single `p` action opens the existing PR in the foreground browser, or opens
+GitHub's PR creation form if no PR exists. Complete creation in the browser, not
+in local title/body/confirmation prompts. Lookup/auth/network errors are reported,
+not treated as a missing PR. **It never pushes automatically**; use `P` separately
+when needed. Commit, push, and PR operations cannot be undone by Redline.
 
-Removed code is drawn with `virt_lines` and comments with `virt_text` — neither is buffer
-text, so `y` cannot reach them. This is the way out. One block copies as bare code ready to
-paste back; a whole file gets `@@ path:line @@` headers. In the panels, `y` copies the entry
-under the cursor (the *whole* comment, not the one wrapped line) and `Y` copies everything.
+## Notes, Viewed, and Diff
 
-### long deletions
+Notes are saved in `<repo>/.comments.txt` as `path:line: text` or
+`path:start-end: text`. Ranges follow buffer edits and update on save; one note
+can exist per start line. Concurrent instances preserve other paths' notes,
+but simultaneous edits to the same path are last-writer-wins.
 
-Neovim counts `virt_lines` as **fill** lines, the same as diff filler. Measured behaviour:
-`<C-e>` steps through them one at a time, but `j` and `<C-d>` jump the whole block. So a
-removed block taller than your window is, in practice, unreachable — which is why a
-page-sized deletion reads as "it doesn't scroll".
+Viewed marks track individual changed-line occurrences, follow edits, and
+invalidate when content changes. Saved marks restore only for a matching file
+snapshot; external changes may require another review.
 
-Blocks are therefore truncated to what fits the window, with a footer:
+PR review comments fetch in the background, with one automatic attempt per repo
+per session. No PR is silent; outdated comments are retained. `github = false`
+disables GitHub features, including the `p` action.
 
-```
-  ▁ removed line 14
-  ▁ removed line 15
-  ▁ … 185 more removed lines   actions: Peek removed code
-```
+`:Redline diff` (or action `d`) opens a read-only **repo disk snapshot**, including
+untracked files and Git's no-final-newline markers, but excluding unsaved buffers.
+Use `/`, `n`, and `N` to search added/removed text; `q` closes. This also lets you
+read long deletions that are truncated in the overlay. Action `y` copies live
+buffer lines, not virtual removed text or PR comments.
 
-**Peek removed code** opens the whole block in a float. That is a normal scratch buffer holding real
-lines, so `j`, `<C-d>` and `G` all work, and it inherits the file's filetype so the removed
-code is syntax-highlighted. `y` copies the block, `q` / `<Esc>` / `<CR>` closes.
+Action `a` copies the whole repo's saved notes, context, base, and disk diff to the
+unnamed register and available clipboard without confirmation. It never runs an
+agent. Check for secrets before sharing.
 
-When several removed blocks land on the same line — imports stripped from the top *and* a body
-removed below both anchor at line 1 — Peek picks the one that was truncated, since
-reading those is the entire reason the float exists. Set `deleted_max = 0` to draw
-everything inline regardless.
+Action `z` undoes the session's last index, note, or viewed change, even if it was
+in another file/repo. Normal Vim `u` only undoes buffer edits, not these actions.
 
-## Undo
-
-`u` cannot reach any of this — none of it is buffer text. **Undo last Redline action** steps back through the
-redline actions that touched the git index, `.comments.txt`, or the viewed store: staging,
-unstaging, viewed ticks, notes. Index undo snapshots `git ls-files --stage` beforehand and
-restores through `update-index`, including the "was not staged at all" state.
-
-## Setup options
+## Setup
 
 ```lua
 require("redline").setup({
-  mode      = "worktree",  -- "worktree" | "commit" | "branch"
-  enabled   = false,       -- true to have marks on from the moment nvim starts
-  keymaps   = true,        -- false: install no default mappings
-  deletions = "all",       -- "all" | "cursor" | "off" — what opening a diff resets to
-  deleted_max = "auto",    -- longest block drawn inline; a number, or 0 for no cap
-  github    = true,        -- false stops it shelling out to gh entirely
+  mode = "worktree",     -- "worktree" | "commit" | "branch"
+  enabled = false,       -- overlay off until requested
+  keymaps = true,
+  deletions = "all",     -- "all" | "cursor" | "off"; reset when opening review
+  deleted_max = "auto",  -- inline deletion cap; number, or 0 for no cap
+  comments = "cursor",  -- "off" | "cursor" | "all"; PR comment bodies
+  github = true,
 })
 ```
 
-## Commands
+`:Redline` equals `:Redline open`. Command completion exposes only `open`,
+`actions`, `diff`, and `help`. Historical subcommands and Lua APIs remain
+available for existing configurations; their no-argument scopes may differ from
+the default mappings.
 
-`:Redline` is equivalent to `:Redline open`. Completion exposes only:
-
-```
-open actions diff help
-```
-
-Previously shipped subcommands remain hidden aliases for existing configurations.
-
-## Colours
-
-Four clearly different hues plus neutrals, rather than saturation variants of one colour —
-"green vs slightly-duller green" is the one distinction the eye cannot make while scanning.
-Shape carries add/change/delete, colour carries staged/viewed, so neither channel has to do
-both jobs and it survives colourblindness. Every group is a normal highlight you can override:
-`RedlineAdd`, `RedlineChange`, `RedlineDelete`, `RedlineStaged`, `RedlineViewed`,
-`RedlineNote`, `RedlineGh`, each with an `…Ln` line variant.
+Highlights: `RedlineAdd`, `RedlineChange`, `RedlineDelete`, `RedlineStaged`,
+`RedlineViewed`, `RedlineNote`, and `RedlineGh`, with `Ln` background and `Virt`
+virtual-line variants. Override them like normal highlight groups.
 
 ## License
 

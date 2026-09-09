@@ -214,7 +214,12 @@ end
 -- all", which is a state we have to be able to restore too.
 local function index_entry(root, rel)
     local out = git(root, { "--literal-pathspecs", "ls-files", "--stage", "--", rel })
-    if not out or vim.trim(out) == "" then return false end
+    if not out then return nil end
+    if vim.trim(out) == "" then return false end
+    if not out:match("^%d+%s+%x+%s+0\t") then
+        vim.notify("redline: resolve index conflicts before staging or unstaging", vim.log.levels.WARN)
+        return nil
+    end
     local mode, sha = out:match("^(%d+)%s+(%x+)")
     if not mode then return false end
     return { mode = mode, sha = sha }
@@ -1955,6 +1960,29 @@ function M.help() require("redline.workflow").help() end
 -- staging
 -- ─────────────────────────────
 
+local function staging_mode(root, rel, snap)
+    if not snap then
+        -- check-ignore takes paths, not pathspecs, and rejects --literal-pathspecs.
+        local ignored = vim.system({ "git", "-C", root, "check-ignore", "-q", "--", "./" .. rel }):wait()
+        if ignored.code ~= 1 then
+            vim.notify(ignored.code == 0 and "redline: refusing to stage ignored untracked file " .. rel
+                or "redline: cannot check ignore rules; staging refused", vim.log.levels.WARN)
+            return nil
+        end
+    end
+    local stat = uv.fs_lstat(root .. "/" .. rel)
+    if (snap and snap.mode ~= "100644" and snap.mode ~= "100755") or (stat and stat.type ~= "file") then
+        vim.notify("redline: buffer staging supports regular files only", vim.log.levels.WARN)
+        return nil
+    end
+    local filemode = git(root, { "config", "--bool", "--get", "core.fileMode" })
+    if stat and vim.trim(filemode or "true") ~= "false" then
+        -- Git records the owner's execute bit, not whether access(X_OK) succeeds.
+        return bit.band(stat.mode, 64) ~= 0 and "100755" or "100644"
+    end
+    return snap and snap.mode or "100644"
+end
+
 -- Which index->buffer hunks touch [first, last] in buffer coordinates.
 local function hunks_in_range(hunks, first, last, visual)
     local out = {}
@@ -1973,7 +2001,7 @@ end
 
 -- Construct the desired index text, then let xdiff handle patch coordinates and
 -- missing-newline markers. Keep line endings attached while splicing.
-local function build_patch(rel, old, new, hunks, first, last, mode)
+local function build_patch(rel, old, new, hunks, first, last, mode, selected)
     local function lines(text)
         local out = {}
         for line in text:gmatch("[^\n]*\n?") do
@@ -1985,16 +2013,34 @@ local function build_patch(rel, old, new, hunks, first, last, mode)
     for n = #hunks, 1, -1 do
         local h = hunks[n]
         local sa, ca, sb, cb = h[1], h[2], h[3], h[4]
-        local lo, hi = 0, cb - 1
-        if first then lo, hi = math.max(0, first - sb), math.min(cb - 1, last - sb) end
-        -- Pair replacement lines by offset. Only selecting the entire new side
-        -- removes surplus old lines; a partial selection leaves those untouched.
-        local offset = math.min(lo, ca)
-        local count = math.max(0, math.min(hi + 1, ca) - offset)
-        if lo == 0 and hi == cb - 1 then count = ca end
-        local at = (ca == 0 and sa or sa - 1) + offset
-        for _ = 1, count do table.remove(target, at + 1) end
-        for i = hi, lo, -1 do table.insert(target, at + 1, source[sb + i]) end
+        if selected then
+            -- Reverse HEAD->index by index-line identity, not by a new diff's
+            -- potentially different pairing. Virtual deletions have no identity.
+            local complete = cb > 0
+            for i = 0, cb - 1 do complete = complete and selected[sb + i] end
+            if complete then
+                for _ = 1, cb do table.remove(target, sb) end
+                for i = ca - 1, 0, -1 do table.insert(target, sb, source[sa + i]) end
+            else
+                for i = cb - 1, 0, -1 do
+                    if selected[sb + i] then
+                        table.remove(target, sb + i)
+                        if i < ca then table.insert(target, sb + i, source[sa + i]) end
+                    end
+                end
+            end
+        else
+            local lo, hi = 0, cb - 1
+            if first then lo, hi = math.max(0, first - sb), math.min(cb - 1, last - sb) end
+            -- Pair replacement lines by offset. Only selecting the entire new side
+            -- removes surplus old lines; a partial selection leaves those untouched.
+            local offset = math.min(lo, ca)
+            local count = math.max(0, math.min(hi + 1, ca) - offset)
+            if lo == 0 and hi == cb - 1 then count = ca end
+            local at = (ca == 0 and sa or sa - 1) + offset
+            for _ = 1, count do table.remove(target, at + 1) end
+            for i = hi, lo, -1 do table.insert(target, at + 1, source[sb + i]) end
+        end
     end
     -- A retained unterminated EOF line needs a separator if we append after it.
     for i = 1, #target - 1 do
@@ -2008,7 +2054,7 @@ local function build_patch(rel, old, new, hunks, first, last, mode)
     local a, b = quote("a/" .. rel), quote("b/" .. rel)
     return "diff --git " .. a .. " " .. b .. "\n"
         .. (mode and "new file mode " .. mode .. "\n" or "")
-        .. "--- " .. (mode and "/dev/null" or a) .. "\n+++ " .. b .. "\n" .. body
+        .. "--- " .. (mode and "/dev/null" or a) .. "\n+++ " .. b .. "\n" .. body, table.concat(target)
 end
 
 -- Stage the cursor hunk, or only selected added/replacement buffer lines.
@@ -2037,6 +2083,19 @@ function M.stage(first, last)
     end
 
     local snap = index_entry(root, rel)
+    if snap == nil then return end
+    local mode = staging_mode(root, rel, snap)
+    if not mode then return end
+    local attrs = git(root, { "check-attr", "-z", "filter", "working-tree-encoding", "--", rel })
+    if not attrs then return end
+    local fields = vim.split(attrs, "\0", { plain = true })
+    for i = 3, #fields, 3 do
+        if fields[i] ~= "unspecified" and fields[i] ~= "unset" then
+            vim.notify("redline: partial staging of filtered/encoded files is unsafe; use whole-file stage",
+                vim.log.levels.WARN)
+            return
+        end
+    end
     local old = ""
     if snap then
         -- Read the snapshot blob, not the rendering cache (external staging and
@@ -2053,12 +2112,18 @@ function M.stage(first, last)
         return
     end
 
-    local mode
-    if not snap then
-        mode = vim.fn.executable(api.nvim_buf_get_name(bufnr)) == 1 and "100755" or "100644"
-    end
-    local patch = build_patch(rel, old, new, hunks, visual and first or nil, last, mode)
+    local patch, target = build_patch(rel, old, new, hunks, visual and first or nil, last, not snap and mode or nil)
     if not patch then M.legend("nothing unstaged here"); return end
+    -- A partial patch mixes index and live text. Never apply it if Git would
+    -- rewrite that mixture (e.g. CRLF/ident conversion), even without a filter.
+    local clean = vim.system({ "git", "-C", root, "hash-object", "--path=" .. rel, "--stdin" },
+        { stdin = target }):wait()
+    local raw = vim.system({ "git", "-C", root, "hash-object", "--no-filters", "--stdin" },
+        { stdin = target }):wait()
+    if clean.code ~= 0 or raw.code ~= 0 or clean.stdout ~= raw.stdout then
+        vim.notify("redline: partial staging requires clean conversion; use whole-file stage", vim.log.levels.WARN)
+        return
+    end
     local res = vim.system(
         { "git", "-C", root, "apply", "--cached", "--unidiff-zero", "--whitespace=nowarn", "-" },
         { stdin = patch, text = true }):wait()
@@ -2079,17 +2144,22 @@ function M.stage(first, last)
     M.legend(visual and "staged selected lines" or string.format("staged %d hunk%s", #hunks, #hunks == 1 and "" or "s"))
 end
 
+-- Whole-file means the live buffer, not the disk file. Hashing also handles
+-- empty new files, for which there is no textual patch to apply.
 function M.stage_file()
     local bufnr = api.nvim_get_current_buf()
     local root = get_root(bufnr)
     if not root then return end
     local rel = relpath(root, bufnr)
     if not rel then return end
-    if vim.bo[bufnr].modified then vim.cmd("silent write") end
-
     local snap = index_entry(root, rel)
-    if git(root, { "add", "--", rel }) == nil then
-        vim.notify("redline: git add failed", vim.log.levels.ERROR)
+    if snap == nil then return end
+    local mode = staging_mode(root, rel, snap)
+    if not mode then return end
+    local blob = vim.system({ "git", "-C", root, "hash-object", "-w", "--path=" .. rel, "--stdin" },
+        { stdin = buf_text(bufnr) }):wait()
+    if blob.code ~= 0 or not restore_index(root, rel, { mode = mode, sha = vim.trim(blob.stdout or "") }) then
+        vim.notify("redline: staging buffer failed", vim.log.levels.ERROR)
         return
     end
     push_undo("stage " .. rel, function()
@@ -2103,8 +2173,6 @@ function M.stage_file()
     M.legend("staged " .. rel)
 end
 
--- Unstaging is whole-file only: the index can hold content that is nowhere on
--- screen, so there is no honest way to point at "this hunk" of it.
 function M.unstage_file()
     local bufnr = api.nvim_get_current_buf()
     local root = get_root(bufnr)
@@ -2113,7 +2181,11 @@ function M.unstage_file()
     if not rel then return end
 
     local snap = index_entry(root, rel)
-    if git(root, { "restore", "--staged", "--", rel }) == nil then
+    if snap == nil then return end
+    local head = git(root, { "rev-parse", "--verify", "HEAD" })
+    local args = head and { "--literal-pathspecs", "restore", "--source=HEAD", "--staged", "--", rel }
+        or { "--literal-pathspecs", "update-index", "--force-remove", "--", rel }
+    if git(root, args) == nil then
         vim.notify("redline: unstage failed", vim.log.levels.ERROR)
         return
     end
@@ -2126,6 +2198,103 @@ function M.unstage_file()
     render_diff(bufnr)
     panels_refresh()
     M.legend("unstaged " .. rel)
+end
+
+function M.unstage(first, last)
+    if first == nil then return M.unstage_file() end
+    last = last or first
+    if type(first) ~= "number" or type(last) ~= "number"
+        or first % 1 ~= 0 or last % 1 ~= 0 then return end
+    first, last = math.min(first, last), math.max(first, last)
+    local bufnr = api.nvim_get_current_buf()
+    local root = get_root(bufnr)
+    local rel = root and relpath(root, bufnr)
+    if not rel then return end
+    local snap = index_entry(root, rel)
+    if snap == nil then return end
+    if not snap then M.legend("nothing staged on selected live lines"); return end
+    if snap.mode ~= "100644" and snap.mode ~= "100755" then
+        vim.notify("redline: selected unstaging supports regular files only", vim.log.levels.WARN)
+        return
+    end
+    local blob = vim.system({ "git", "-C", root, "cat-file", "blob", snap.sha }):wait()
+    if blob.code ~= 0 then return end
+    local index, live = blob.stdout, buf_text(bufnr)
+    local opts = { result_type = "indices", algorithm = "histogram" }
+    local selected, offset, next_line = {}, 0, 1
+    -- Only unchanged index->buffer spans have a trustworthy line mapping.
+    -- Insertions are selectable but have no index counterpart; replacements
+    -- are ambiguous even when their old/new line counts happen to match.
+    for _, h in ipairs(vim.diff(index, live, opts)) do
+        local ca, sb, cb = h[2], h[3], h[4]
+        local start = cb == 0 and sb + 1 or sb
+        for line = math.max(first, next_line), math.min(last, start - 1) do
+            selected[line + offset] = true
+        end
+        if ca > 0 and cb > 0 and sb <= last and sb + cb - 1 >= first then
+            vim.notify("redline: selected unstaged replacement cannot be mapped safely to the index; use whole-file unstage",
+                vim.log.levels.WARN)
+            return
+        end
+        next_line, offset = start + cb, offset + ca - cb
+    end
+    for line = math.max(first, next_line), math.min(last, api.nvim_buf_line_count(bufnr)) do
+        selected[line + offset] = true
+    end
+    local head_blob = vim.system({ "git", "-C", root, "cat-file", "blob", "HEAD:" .. rel }):wait()
+    local head = head_blob.code == 0 and head_blob.stdout or ""
+    local hunks = vim.diff(head, index, opts)
+    local patch, target = build_patch(rel, index, head, hunks, nil, nil, nil, selected)
+    if not patch then
+        M.legend("nothing staged on selected live lines; pure deletions need whole-file unstage")
+        return
+    end
+    local res
+    if head_blob.code ~= 0 and target == "" then
+        res = { code = restore_index(root, rel, false) and 0 or 1 }
+    else
+        res = vim.system({ "git", "-C", root, "apply", "--cached", "--unidiff-zero", "--whitespace=nowarn", "-" },
+            { stdin = patch, text = true }):wait()
+    end
+    if res.code ~= 0 then
+        vim.notify("redline: unstaging failed\n" .. (res.stderr or ""), vim.log.levels.ERROR)
+        return
+    end
+    push_undo("unstage selected lines in " .. rel, function()
+        restore_index(root, rel, snap)
+        state.index[bufnr] = nil
+        render_diff(bufnr)
+    end)
+    state.index[bufnr] = nil
+    render_diff(bufnr)
+    panels_refresh()
+    M.legend("unstaged selected lines")
+end
+
+function M.select_hunk()
+    local bufnr = api.nvim_get_current_buf()
+    local root = get_root(bufnr)
+    local rel = root and relpath(root, bufnr)
+    if not rel then return end
+    state.rev[root], state.base[bufnr] = nil, nil
+    local hunks = vim.diff(base_text(bufnr, root, rel), buf_text(bufnr),
+        { result_type = "indices", algorithm = "histogram" })
+    local cursor = api.nvim_win_get_cursor(0)[1]
+    local deletion = false
+    for _, h in ipairs(hunks) do
+        local first, count = h[3], h[4]
+        if count > 0 and cursor >= first and cursor < first + count then
+            vim.cmd("normal! \27")
+            api.nvim_win_set_cursor(0, { first, 0 })
+            vim.cmd("normal! V")
+            api.nvim_win_set_cursor(0, { first + count - 1, 0 })
+            return
+        end
+        if count == 0 and cursor >= math.max(1, first) and cursor <= first + 1 then deletion = true end
+    end
+    vim.notify(deletion
+        and "redline: removed code has no selectable lines; use a whole-file action or d in actions to read the diff"
+        or "redline: no review chunk under the cursor", vim.log.levels.INFO)
 end
 
 -- ─────────────────────────────
@@ -2594,8 +2763,8 @@ function M.clear_notes()
     end
 end
 
-function M.open_notes()
-    local root = get_root(api.nvim_get_current_buf())
+function M.open_notes(root)
+    root = root or current_root()
     if not root then return end
     sync_notes(api.nvim_get_current_buf())
     vim.cmd("edit " .. vim.fn.fnameescape(notes_path(root)))
@@ -3043,13 +3212,13 @@ function M.setup(opts)
         map("n", "<leader>h?", M.help, { desc = "Redline: help" })
         map("n", "]h", function() M.next_hunk(false) end, { desc = "Diff: next changed line" })
         map("n", "[h", function() M.next_hunk(true) end, { desc = "Diff: prev changed line" })
-        map("n", "<leader>hv", function() M.toggle_viewed() end, { desc = "Viewed: toggle hunk under cursor" })
+        map("n", "<leader>hv", function() M.toggle_viewed(1, api.nvim_buf_line_count(0)) end, { desc = "Viewed: toggle whole file" })
         map("x", "<leader>hv", function()
             local a, b = visual_range()
             vim.cmd("normal! \27")
             M.toggle_viewed(a, b)
         end, { desc = "Viewed: toggle selection" })
-        map("n", "<leader>hc", M.add_note, { desc = "Note: add/edit on this line" })
+        map("n", "<leader>hc", function() M.add_note(1, api.nvim_buf_line_count(0)) end, { desc = "Note: add/edit whole file" })
         map("x", "<leader>hc", function()
             local a, b = visual_range()
             vim.cmd("normal! \27")

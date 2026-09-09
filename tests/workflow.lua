@@ -70,10 +70,11 @@ local ok, err = xpcall(function()
     vim.cmd.close()
     assert(api.nvim_get_current_buf() == original)
     local captured
-    vim.ui.select = function(items) captured = items end
+    local actions = w.actions
+    w.actions = function() captured = true end
     w.open_target(root, root .. "/[new] space.txt", 1, true)
     assert(api.nvim_buf_get_name(0) == root .. "/[new] space.txt", api.nvim_buf_get_name(0))
-    assert(captured[1][1] == "Stage hunk")
+    assert(captured)
     local picker_opts, mappings, enter, closed = nil, {}, nil, false
     package.loaded["telescope.pickers"] = { new = function(_, opts)
         picker_opts = opts
@@ -131,67 +132,239 @@ local ok, err = xpcall(function()
         vim.fn.maparg(key, "n", false, true).callback()
         assert(not api.nvim_win_is_valid(panel), "selection closes split")
         assert(api.nvim_buf_get_name(0) == root .. "/[new] space.txt")
-        if key == "a" then assert(captured and captured[1][1] == "Stage hunk") end
+        if key == "a" then assert(captured) end
     end
-    local stages = 0
-    r.stage = function(a, b) assert(a == 1 and b == 2); stages = stages + 1 end
-    w.actions(1, 2)
-    local stage = captured[1][2]
-    vim.ui.select = function(_, _, cb) cb("Cancel") end
-    stage()
-    assert(stages == 0)
-    vim.ui.select = function(_, _, cb) cb("Confirm") end
-    stage()
-    assert(stages == 1)
-    api.nvim_buf_set_lines(0, 0, -1, false, { "changed while menu was open" })
-    stage()
-    assert(stages == 1)
+    w.actions = actions
+    vim.ui.select = function() error("unexpected selection prompt") end
+    vim.ui.input = function() error("unexpected input prompt") end
     w.handoff(c)
     contains(vim.fn.getreg('"'), "saved note")
     contains(vim.fn.getreg('"'), "Base: HEAD")
     git("add", "file.txt")
-    local calls = {}
-    r.reload = function() end
+    local calls, notifications, reloads = {}, {}, 0
+    local response = { code = 0, stdout = "mock completed", stderr = "" }
+    local pending = 0
+    vim.notify = function(message) notifications[#notifications + 1] = message end
+    r.reload = function() reloads = reloads + 1 end
     vim.system = function(argv, opts, cb)
         if cb then
             assert(opts.cwd == root)
             calls[#calls + 1] = argv
-            cb({ code = 0, stdout = "mock completed", stderr = "" })
+            if argv[1] == "gh" and argv[3] == "create" and vim.fn.has("mac") == 1 then
+                assert(opts.env.GH_BROWSER == "open")
+            end
+            local result = response
+            pending = pending + 1
+            vim.schedule(function() cb(result); pending = pending - 1 end)
             return {}
         end
         assert(argv[1] == "git", "network operation must be async")
+        assert(argv[2] == "-C", "mutating commands must be mocked")
         return system(argv, opts)
     end
-    vim.ui.input = function(_, cb) cb("message; $(touch NOT_EXECUTED)") end
-    vim.ui.select = function(_, _, cb) cb("Cancel") end
+    local function flush()
+        assert(vim.wait(1000, function() return pending == 0 end))
+        vim.wait(20, function() return false end)
+    end
+    vim.ui.input = function(opts, cb)
+        contains(opts.prompt, "staged changes ONLY")
+        contains(opts.prompt, "file.txt")
+        cb(nil)
+    end
     w.commit(c)
     assert(#calls == 0)
-    vim.ui.select = function(_, _, cb) cb("Confirm") end
+    vim.ui.input = function(_, cb) cb("   ") end
     w.commit(c)
+    assert(#calls == 0)
+    vim.ui.input = function(_, cb) cb("message; $(touch NOT_EXECUTED)") end
+    w.commit(c)
+    flush()
     assert(vim.deep_equal(calls[1], { "git", "commit", "-m", "message; $(touch NOT_EXECUTED)" }))
-    vim.ui.input = function(_, cb) cb("topic") end
-    vim.ui.select = function(items, _, cb) cb(items[1] == "Cancel" and "Confirm" or items[1]) end
+    assert(reloads == 1)
+    vim.ui.input = function() error("unexpected input prompt") end
     w.push(c)
+    flush()
     assert(vim.deep_equal(calls[2], { "git", "push", "--", "origin", "HEAD:refs/heads/topic" }))
+    assert(reloads == 2)
+    git("config", "branch.topic.remote", "origin")
+    git("config", "branch.topic.merge", "refs/heads/main")
+    w.push(c)
+    flush()
+    assert(#calls == 2, "topic tracking origin/main must not automatically push")
+    contains(notifications[#notifications], "push refused")
+    contains(notifications[#notifications], "configure a matching upstream")
+    git("remote", "add", "upstream", "https://example.invalid/upstream.git")
+    git("config", "branch.topic.remote", "upstream")
+    git("config", "branch.topic.merge", "refs/heads/topic")
+    w.push(c)
+    flush()
+    assert(vim.deep_equal(calls[3], { "git", "push", "--", "upstream", "HEAD:refs/heads/topic" }))
+    git("config", "--unset", "branch.topic.remote")
+    git("config", "--unset", "branch.topic.merge")
     vim.ui.select = function(_, _, cb) cb(nil) end
     w.push(c)
-    assert(#calls == 2)
-    vim.ui.select = function(items, _, cb) cb(items[1] == "Cancel" and "Confirm" or items[1]) end
+    assert(#calls == 3)
+    vim.ui.select = function(items, _, cb)
+        assert(vim.deep_equal(items, { "origin", "upstream" }))
+        cb("upstream")
+    end
+    response = { code = 1, stdout = "", stderr = "push rejected" }
+    w.push(c)
+    flush()
+    assert(vim.deep_equal(calls[4], { "git", "push", "--", "upstream", "HEAD:refs/heads/topic" }))
+    assert(reloads == 3)
+    contains(notifications[#notifications], "push rejected")
+    vim.ui.select = function() error("unexpected selection prompt") end
+    git("checkout", "--detach")
+    w.push(c)
+    assert(#calls == 4)
+    contains(notifications[#notifications], "detached HEAD")
+    git("checkout", "topic")
+    git("remote", "remove", "origin")
+    git("remote", "remove", "upstream")
+    w.push(c)
+    assert(#calls == 4)
+    contains(notifications[#notifications], "no remote")
+    git("remote", "add", "origin", "https://example.invalid/test.git")
+
+    local browser_urls = {}
+    vim.ui.open = function(url)
+        browser_urls[#browser_urls + 1] = url
+        return nil, "mock browser failure"
+    end
     c.github = true
-    local values = { "title; $(nope)", "body with 'quotes'", "trunk" }
-    vim.ui.input = function(_, cb) cb(table.remove(values, 1)) end
-    w.pr(c, true)
-    assert(vim.deep_equal(calls[3], { "gh", "pr", "create", "--head", "topic", "--base", "trunk",
-        "--title", "title; $(nope)", "--body", "body with 'quotes'", "--draft" }))
-    w.pr(c, false)
-    assert(vim.deep_equal(calls[4], { "gh", "pr", "view", "--web" }))
-    vim.ui.input = function(_, cb) cb(nil) end
-    w.pr(c, true)
-    assert(#calls == 4)
+    c.default_branch = "origin/trunk"
+    calls = {}
+    response = { code = 0, stdout = '{"url":"https://github.com/test/repo/pull/1"}', stderr = "" }
+    w.pr(c)
+    assert(#calls == 1, "lookup must finish before opening browser")
+    flush()
+    assert(vim.deep_equal(calls[1], { "gh", "pr", "view", "--json", "url" }))
+    if vim.fn.has("mac") == 1 then
+        assert(vim.deep_equal(calls[2], { "open", "https://github.com/test/repo/pull/1" }))
+    else
+        assert(browser_urls[1] == "https://github.com/test/repo/pull/1")
+    end
+    assert(reloads == 3, "read-only browser workflows must not reload")
+    for _, failure in ipairs({ "authentication required", "HTTP 401: Bad credentials", "network unavailable",
+        'no pull requests found for branch "other"', 'no pull requests found for branch "topic"\nHTTP 403' }) do
+        calls = {}
+        response = { code = 1, stdout = "", stderr = failure }
+        w.pr(c)
+        flush()
+        assert(#calls == 1, "lookup errors must not open creation page")
+        contains(notifications[#notifications], failure)
+    end
+    calls = {}
+    response = { code = 0, stdout = "invalid JSON", stderr = "" }
+    w.pr(c)
+    flush()
+    assert(#calls == 1)
+    contains(notifications[#notifications], "invalid PR response")
+    calls = {}
+    response = { code = 1, stdout = "", stderr = 'no pull requests found for branch "topic"\n' }
+    w.pr(c)
+    flush()
+    assert(vim.deep_equal(calls[2], { "gh", "pr", "create", "--web", "--head", "topic", "--base", "trunk" }))
+    assert(#calls == 2 and reloads == 3)
+    for _, base in ipairs({ "release/stable", "origin/release/stable", "refs/remotes/origin/release/stable" }) do
+        calls = {}
+        c.default_branch = base
+        w.pr(c)
+        flush()
+        assert(vim.deep_equal(calls[2], { "gh", "pr", "create", "--web", "--head", "topic", "--base", "release/stable" }))
+    end
+    calls = {}
+    c.default_branch = false
+    w.pr(c)
+    flush()
+    assert(vim.deep_equal(calls[2], { "gh", "pr", "create", "--web", "--head", "topic" }))
+    calls = {}
     c.github = false
-    w.pr(c, false)
-    assert(#calls == 4)
-    vim.wait(20, function() return false end)
+    w.pr(c)
+    assert(#calls == 0)
+    c.github = true
+    git("checkout", "--detach")
+    w.pr(c)
+    assert(#calls == 0)
+    contains(notifications[#notifications], "detached HEAD")
+    git("checkout", "topic")
+    response = { code = 1, stdout = "", stderr = "commit hook rejected" }
+    vim.ui.input = function(_, cb) cb("message") end
+    w.commit(c)
+    flush()
+    assert(reloads == 3)
+    contains(notifications[#notifications], "commit hook rejected")
+    git("reset", "--", "file.txt")
+    vim.ui.input = function() error("nothing staged must not prompt") end
+    w.commit(c)
+    contains(notifications[#notifications], "nothing staged")
+
+    local has = vim.fn.has
+    vim.fn.has = function(feature) return feature == "mac" and 0 or has(feature) end
+    response = { code = 0, stdout = '{"url":"https://github.com/test/repo/pull/1"}', stderr = "" }
+    w.pr(c)
+    flush()
+    contains(notifications[#notifications], "mock browser failure")
+    vim.ui.open = function()
+        return {
+            is_closing = function() return true end,
+            wait = function(_, timeout)
+                assert(timeout == 0)
+                return { code = 1, stderr = "browser exited unsuccessfully" }
+            end,
+        }
+    end
+    w.pr(c)
+    flush()
+    assert(vim.wait(1000, function()
+        return notifications[#notifications]:find("browser exited unsuccessfully", 1, true) ~= nil
+    end))
+    vim.fn.has = function(feature) return feature == "mac" and 1 or has(feature) end
+    local mocked_system = vim.system
+    vim.system = function(argv, opts, cb)
+        if argv[1] == "open" then
+            assert(vim.deep_equal(argv, { "open", "https://github.com/test/repo/pull/1" }))
+            cb({ code = 1, stdout = "", stderr = "open failed" })
+            return {}
+        end
+        return mocked_system(argv, opts, cb)
+    end
+    w.pr(c)
+    flush()
+    contains(notifications[#notifications], "open failed")
+    vim.system = function(argv, opts, cb)
+        if cb then error("mock executable not found") end
+        return mocked_system(argv, opts, cb)
+    end
+    w.pr(c)
+    contains(notifications[#notifications], "mock executable not found")
+    assert(reloads == 3)
+    vim.fn.has = has
+    vim.system = mocked_system
+    calls = {}
+    response = { code = 1, stdout = "", stderr = "mock push rejected" }
+    git("remote", "add", "fork", "https://example.invalid/fork.git")
+    git("config", "branch.topic.remote", "origin")
+    git("config", "branch.topic.merge", "refs/heads/topic")
+    git("config", "remote.pushDefault", "fork")
+    w.push(c)
+    flush()
+    assert(vim.deep_equal(calls[1], { "git", "push", "--", "fork", "HEAD:refs/heads/topic" }))
+    git("config", "branch.topic.pushRemote", "origin")
+    w.push(c)
+    flush()
+    assert(vim.deep_equal(calls[2], { "git", "push", "--", "origin", "HEAD:refs/heads/topic" }))
+    git("config", "branch.topic.merge", "refs/heads/main")
+    w.push(c)
+    flush()
+    assert(#calls == 2, "push remote overrides must not bypass mismatched-upstream refusal")
+    git("config", "branch.topic.merge", "refs/heads/topic")
+    git("config", "branch.topic.pushRemote", "missing")
+    w.push(c)
+    assert(#calls == 2)
+    contains(notifications[#notifications], "configured branch remote is unavailable")
+    assert(reloads == 3)
 end, debug.traceback)
 vim.system = system
 vim.fn.delete(root, "rf")

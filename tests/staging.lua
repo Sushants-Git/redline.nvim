@@ -43,7 +43,9 @@ local function run()
     upvalue(M.stage, "render_diff", function() end)
     upvalue(M.stage, "panels_refresh", function() end)
     M.legend = function() end
+    local messages = {}
     vim.notify = function(msg, level)
+        messages[#messages + 1] = msg
         if level == vim.log.levels.ERROR then error(msg) end
     end
     local state = upvalue(M.stage, "state")
@@ -139,6 +141,142 @@ local function run()
     state.undo[#state.undo].fn()
     eq("", git({ "--literal-pathspecs", "ls-files", "--", "glob-[a].txt" }))
     eq("decoy\n", git({ "cat-file", "blob", ":glob-a.txt" }))
+    -- Whole-file staging uses the live buffer, including deletions and empty
+    -- untracked files, without a write or pathspec expansion (also before HEAD).
+    for _, case in ipairs({
+        { "a\nb\nc\n", "a\nc\n" }, { "a\n", "" },
+        { false, "" }, { false, "unsaved\n" }, { "old\n", "new" },
+    }) do
+        local buf
+        contents, rel, buf = fixture(case[1], case[2])
+        local modified = vim.bo[buf].modified
+        M.stage_file()
+        eq(case[2], contents())
+        eq(modified, vim.bo[buf].modified)
+        eq(nil, vim.uv.fs_stat(root .. "/" .. rel))
+        state.undo[#state.undo].fn()
+        if case[1] then eq(case[1], contents())
+        else eq("", git({ "--literal-pathspecs", "ls-files", "--", rel })) end
+    end
+    fixture("decoy\n", "decoy\n", "whole-a.txt")
+    contents = fixture(nil, "literal\n", "whole-[a].txt")
+    M.stage_file()
+    eq("literal\n", contents())
+    eq("decoy\n", git({ "cat-file", "blob", ":whole-a.txt" }))
+    -- Ignore checks also apply to buffers that have never existed on disk.
+    vim.fn.writefile({ "*.env", "!allowed.env", "literal-a.txt" }, root .. "/.gitignore")
+    for _, path in ipairs({ "secret.env", "-[secret].env" }) do
+        local buf
+        _, rel, buf = fixture(nil, "secret\n", path)
+        if path == "secret.env" then vim.fn.writefile({ "disk secret" }, root .. "/" .. rel) end
+        local undo = state.undo[#state.undo]
+        M.stage(1, 1)
+        assert(messages[#messages]:match("ignored untracked"))
+        M.stage_file()
+        assert(messages[#messages]:match("ignored untracked"))
+        eq("", git({ "--literal-pathspecs", "ls-files", "--", rel }))
+        eq(undo, state.undo[#state.undo])
+        eq(true, vim.bo[buf].modified)
+        if path == "secret.env" then eq("disk secret", vim.fn.readfile(root .. "/" .. rel)[1])
+        else eq(nil, vim.uv.fs_stat(root .. "/" .. rel)) end
+    end
+    contents = fixture(nil, "literal\n", "literal-[a].txt")
+    M.stage_file()
+    eq("literal\n", contents())
+    contents = fixture(nil, "allowed\n", "allowed.env")
+    M.stage(1, 1)
+    eq("allowed\n", contents())
+    contents = fixture("old\n", "new\n", "tracked.env")
+    M.stage(1, 1)
+    eq("new\n", contents())
+    M.stage_file()
+    eq("new\n", contents())
+
+    -- Mode-only changes use filesystem bits, not executable() or the old mode.
+    local function index_mode(path)
+        return git({ "--literal-pathspecs", "ls-files", "--stage", "--", path }):match("^(%d+)")
+    end
+    contents, rel = fixture("same\n", "same\n")
+    vim.fn.writefile({ "disk stays untouched" }, root .. "/" .. rel)
+    git({ "config", "core.fileMode", "true" })
+    assert(vim.uv.fs_chmod(root .. "/" .. rel, 493)) -- 0755
+    M.stage_file()
+    eq("100755", index_mode(rel))
+    state.undo[#state.undo].fn()
+    eq("100644", index_mode(rel))
+    git({ "config", "core.fileMode", "false" })
+    M.stage_file()
+    eq("100644", index_mode(rel))
+    git({ "config", "core.fileMode", "true" })
+    M.stage_file()
+    eq("100755", index_mode(rel))
+    assert(vim.uv.fs_chmod(root .. "/" .. rel, 420)) -- 0644
+    git({ "config", "core.fileMode", "false" })
+    M.stage_file()
+    eq("100755", index_mode(rel))
+    git({ "config", "core.fileMode", "true" })
+    M.stage_file()
+    eq("100644", index_mode(rel))
+    eq("same\n", contents())
+    eq("disk stays untouched", vim.fn.readfile(root .. "/" .. rel)[1])
+    contents, rel = fixture(nil, "new executable\n")
+    vim.fn.writefile({ "disk" }, root .. "/" .. rel)
+    assert(vim.uv.fs_chmod(root .. "/" .. rel, 493))
+    M.stage(1, 1)
+    eq("100755", index_mode(rel))
+    state.undo[#state.undo].fn()
+    git({ "config", "core.fileMode", "false" })
+    M.stage_file()
+    eq("100644", index_mode(rel))
+    git({ "config", "core.fileMode", "true" })
+
+    -- Real clean conversion, including an LFS-shaped whole-content filter.
+    -- No git-lfs dependency: this exercises Git's actual filter machinery.
+    vim.fn.writefile({ "*.filter filter=upper", "*.lfs filter=pointer", "*.crlf text eol=lf",
+        "*.broken filter=broken" }, root .. "/.gitattributes")
+    git({ "config", "filter.upper.clean", "tr '[:lower:]' '[:upper:]'" })
+    git({ "config", "filter.upper.required", "true" })
+    local pointer = "version https://git-lfs.github.com/spec/v1\noid sha256:" .. string.rep("a", 64) .. "\nsize 8\n"
+    git({ "config", "filter.pointer.clean", "cat >/dev/null; printf '%s' '" .. pointer .. "'" })
+    git({ "config", "filter.pointer.required", "true" })
+    for _, case in ipairs({
+        { "-[literal].filter", "unsaved\n", "UNSAVED\n" },
+        { "asset.lfs", "payload\n", pointer },
+        { "lines.crlf", "one\r\ntwo\r\n", "one\ntwo\n" },
+    }) do
+        local buf
+        contents, rel, buf = fixture(nil, case[2], case[1])
+        vim.fn.writefile({ "disk stays untouched" }, root .. "/" .. rel)
+        local before = api.nvim_buf_get_lines(buf, 0, -1, false)
+        M.stage_file()
+        eq(case[3], contents())
+        eq(vim.trim(git({ "hash-object", "--path=" .. rel, "--stdin" }, case[2])),
+            vim.trim(git({ "rev-parse", ":" .. rel })))
+        eq("disk stays untouched", vim.fn.readfile(root .. "/" .. rel)[1])
+        eq(true, vim.bo[buf].modified)
+        assert(vim.deep_equal(before, api.nvim_buf_get_lines(buf, 0, -1, false)))
+        local snap = git({ "ls-files", "--stage", "--", rel })
+        local undo = state.undo[#state.undo]
+        api.nvim_buf_set_lines(buf, 0, -1, false, { "new payload\r", "more payload\r" })
+        M.stage(1, 1)
+        assert(messages[#messages]:match("use whole%-file stage"))
+        M.stage()
+        eq(snap, git({ "ls-files", "--stage", "--", rel }))
+        eq(undo, state.undo[#state.undo])
+    end
+    _, rel = fixture(nil, "payload\n", "new.lfs")
+    M.stage(1, 1)
+    eq("", git({ "ls-files", "--", rel }))
+    -- A failing required filter must not replace an existing index entry.
+    git({ "config", "filter.broken.clean", "false" })
+    git({ "config", "filter.broken.required", "true" })
+    contents, rel = fixture("staged\n", "unsaved\n", "failure.broken")
+    local undo = state.undo[#state.undo]
+    local ok, err = pcall(M.stage_file)
+    assert(not ok and err:match("staging buffer failed"))
+    eq("staged\n", contents())
+    eq(undo, state.undo[#state.undo])
+    eq(nil, vim.uv.fs_stat(root .. "/" .. rel))
     -- Small exhaustive replacement matrix: additions, balanced replacements,
     -- and replacements with surplus deletions; no unselected new line leaks.
     for old_count = 0, 4 do
