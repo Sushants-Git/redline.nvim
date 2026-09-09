@@ -12,7 +12,7 @@ function P.actions(items, title)
     local state = require("telescope.actions.state")
     pickers.new({}, {
         prompt_title = title,
-        results_title = "letter: run | /: search | Enter: run | Esc/q: close",
+        results_title = "Press a letter | /: search | Enter: choose | Esc/q: close",
         initial_mode = "normal",
         sorting_strategy = "ascending",
         layout_strategy = "vertical",

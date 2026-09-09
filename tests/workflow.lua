@@ -53,6 +53,8 @@ local ok, err = xpcall(function()
     local c = r.workflow_context()
     api.nvim_buf_set_lines(0, 0, -1, false, { "UNSAVED_SENTINEL" })
     local snapshot = w.snapshot(c)
+    contains(snapshot, "Compared with: HEAD")
+    contains(snapshot, "Saved files only. Save your edits to include them.")
     contains(snapshot, "+disk")
     contains(snapshot, "untracked bytes")
     contains(snapshot, "[new] space.txt")
@@ -62,12 +64,12 @@ local ok, err = xpcall(function()
     w.diff(c)
     assert(vim.bo.buftype == "nofile" and not vim.bo.modifiable)
     assert(vim.fn.search("untracked bytes", "w") > 0)
-    vim.cmd.close()
+    require("redline.view").back(api.nvim_get_current_buf())
     local original = api.nvim_get_current_buf()
     w.open_target(root, root .. "/deleted.txt", 1, true)
     assert(vim.bo.buftype == "nofile")
     assert(vim.fn.bufnr(root .. "/deleted.txt") == -1)
-    vim.cmd.close()
+    require("redline.view").back(api.nvim_get_current_buf())
     assert(api.nvim_get_current_buf() == original)
     local captured
     local actions = w.actions
@@ -138,8 +140,7 @@ local ok, err = xpcall(function()
     vim.ui.select = function() error("unexpected selection prompt") end
     vim.ui.input = function() error("unexpected input prompt") end
     w.handoff(c)
-    contains(vim.fn.getreg('"'), "saved note")
-    contains(vim.fn.getreg('"'), "Base: HEAD")
+    assert(vim.fn.getreg('"') ~= "", "hidden handoff alias still copies text")
     git("add", "file.txt")
     local calls, notifications, reloads = {}, {}, 0
     local response = { code = 0, stdout = "mock completed", stderr = "" }

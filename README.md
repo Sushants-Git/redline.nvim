@@ -45,10 +45,13 @@ come from disk, not unsaved buffers.
 | `<leader>ha` | actions for the whole file | actions for selected lines |
 | `<leader>hc` | add/edit a whole-file note | add/edit a selection note |
 | `<leader>hv` | toggle viewed for changed lines in the whole file | toggle viewed for selected changed lines |
+| `<leader>hb` | back to Changes after opening a file | |
 | `]h` / `[h` | next / previous changed location | |
 | `<leader>h?` | help | |
 
 Redline does not set your leader. Set `keymaps = false` to disable default maps.
+The `hb` mapping is added only if it does not conflict with an existing mapping.
+Without it, use `:lua require('redline').back_to_review()`.
 Selections are line-based, including characterwise and blockwise selections.
 
 ## Actions
@@ -60,23 +63,25 @@ also closes. `/` searches actions; it does not open the diff.
 
 | Key | Scope | Action |
 | --- | --- | --- |
-| `s` | selection, otherwise file | stage |
-| `u` | selection, otherwise file | unstage |
-| `c` | selection, otherwise file | add/edit comment (local note) |
-| `v` | selection, otherwise file | toggle viewed |
-| `y` | selection, otherwise file | copy live buffer lines |
-| `h` | file, at cursor | select review chunk |
-| `f` | repo | file overview |
-| `d` | repo | searchable disk diff |
-| `n` | repo | saved notes |
-| `a` | whole repo | copy AI handoff: saved notes + disk diff |
-| `C` | repo index | commit staged changes |
-| `P` | repo branch | push |
-| `p` | repo | open PR or creation form in browser |
-| `z` | session, not just this file/repo | undo last Redline action, excluding publishing |
+| `s` | selection, otherwise file | Stage |
+| `u` | selection, otherwise file | Unstage |
+| `c` | selection, otherwise file | Comment (local note) |
+| `v` | selection, otherwise file | Toggle viewed |
+| `y` | selection, otherwise file | Copy (live buffer lines) |
+| `h` | file, at cursor | Select chunk at cursor (file) |
+| `f` | repo | Show changed files |
+| `d` | repo | Read changes (all files) |
+| `n` | repo saved notes | Read saved notes (all files) |
+| `a` | selection, otherwise current file | Copy for AI |
+| `C` | repo index | Commit staged changes (all files) |
+| `P` | repo branch | Push this branch |
+| `p` | repo | Open pull request |
+| `z` | session, not just this file/repo | Undo last review action |
 
-Local actions, code copy, handoff, and undo have **no confirmation step**. Comment
-asks for note text; empty input deletes the note at that range's start.
+Stage, Unstage, Comment, Toggle viewed, and Copy labels show `file` or
+`selected lines X-Y`. Local actions, copying, and undo have **no confirmation
+step**. Comment asks for note text; empty input deletes the note at that range's
+start.
 
 To act on a chunk, put the cursor inside it, open `<leader>ha`, press `h`, then
 open **Visual `<leader>ha`** and choose an action. `h` only selects; it does not
@@ -141,15 +146,37 @@ PR review comments fetch in the background, with one automatic attempt per repo
 per session. No PR is silent; outdated comments are retained. `github = false`
 disables GitHub features, including the `p` action.
 
-`:Redline diff` (or action `d`) opens a read-only **repo disk snapshot**, including
-untracked files and Git's no-final-newline markers, but excluding unsaved buffers.
-Use `/`, `n`, and `N` to search added/removed text; `q` closes. This also lets you
-read long deletions that are truncated in the overlay. Action `y` copies live
-buffer lines, not virtual removed text or PR comments.
+`:Redline diff` (or `d`, **Read changes (all files)**) opens Changes in a read-only,
+full-screen tab. It compares saved files with the review base, includes untracked
+files and no-final-newline markers, and leaves out `.comments.txt` and unsaved
+edits. Use it to read long deletions cut short in the overlay.
 
-Action `a` copies the whole repo's saved notes, context, base, and disk diff to the
-unnamed register and available clipboard without confirmation. It never runs an
-agent. Check for secrets before sharing.
+- `/` searches text; `n` / `N` move between matches.
+- `]h` / `[h` move to the next / previous diff hunk.
+- Enter maps the saved diff line to its live source position. If that line was
+  changed or deleted, it uses a nearby surviving line and warns **Approximate
+  location**. It also warns when binary or encoded text cannot be mapped safely.
+  Missing or deleted files stay in the diff.
+- Changes stays open in its tab. Use `<leader>hb` to return directly from the
+  source file. It prefers the last review used from that source window, then the
+  most recently visited open review. `gt` / `gT` still cycle through tabs.
+- `?` opens Help. Changes and Help preserve your existing splits; `q` or Esc
+  means **Back**, closing that view and returning to where you opened it.
+
+Action `y`, **Copy**, copies live buffer lines only, not removed text or comments.
+Action `a`, **Copy for AI**, copies changes from the review base to the live
+buffer, plus local notes and currently loaded PR review comments. It covers only
+the selected lines or the current file, never the whole repo. A selection also
+includes its live code; whole-file copy leaves out unchanged code.
+
+Copy for AI reads fresh saved notes, including external edits, and uses their
+tracked live positions when available. It does not save code or write notes.
+Selection copy includes overlapping notes and PR comments that can be matched
+to those lines, and reports any omitted because their positions are uncertain.
+Whole-file copy includes them, with saved or unavailable positions marked.
+Both copy actions use the unnamed register and try the clipboard. Copy for AI
+does not run an agent or send anything automatically. Check for secrets before
+sharing.
 
 Action `z` undoes the session's last index, note, or viewed change, even if it was
 in another file/repo. Normal Vim `u` only undoes buffer edits, not these actions.

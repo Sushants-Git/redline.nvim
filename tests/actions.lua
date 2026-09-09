@@ -26,7 +26,7 @@ for _, name in ipairs({ "stage", "stage_file", "unstage", "unstage_file", "add_n
     "select_hunk", "overview", "open_notes", "undo" }) do r[name] = record(name) end
 package.loaded.redline = r
 local w = require("redline.workflow")
-for _, name in ipairs({ "diff", "handoff", "commit", "push", "pr" }) do w[name] = record(name) end
+for _, name in ipairs({ "diff", "copy_for_ai", "commit", "push", "pr" }) do w[name] = record(name) end
 local opts, maps, selected, enter, closed
 package.loaded["telescope.pickers"] = { new = function(_, options)
     opts = options
@@ -56,7 +56,7 @@ local function equal(a, b) assert(vim.deep_equal(a, b), vim.inspect(a) .. " ~= "
 local ok, err = xpcall(function()
     open(2, 3)
     assert(opts.initial_mode == "normal" and opts.previewer == false)
-    assert(opts.prompt_title:find("selected lines 2-3: file.txt", 1, true))
+    assert(opts.prompt_title:find("Lines 2-3: file.txt", 1, true))
     assert(opts.results_title:find("/: search", 1, true))
     local keys = {}
     for _, item in ipairs(opts.finder.results) do
@@ -81,12 +81,25 @@ local ok, err = xpcall(function()
     for key, expected in pairs({ s = { "stage_file" }, u = { "unstage_file" },
         c = { "add_note", 1, 4 }, v = { "toggle_viewed", 1, 4 }, h = { "select_hunk" },
         f = { "overview", root }, n = { "open_notes", root }, z = { "undo" }, d = { "diff", c },
-        a = { "handoff", c }, C = { "commit", c }, P = { "push", c }, p = { "pr", c } }) do
+        a = { "copy_for_ai", c, buf }, C = { "commit", c }, P = { "push", c }, p = { "pr", c } }) do
         open()
-        assert(opts.prompt_title == "Redline | file: file.txt")
+        assert(opts.prompt_title == "Redline | Whole file: file.txt")
         press("n" .. key)
         equal(calls[#calls], expected)
     end
+    open(2, 3)
+    press("na")
+    equal(calls[#calls], { "copy_for_ai", c, buf, 2, 3 })
+    local labels = {}
+    for _, item in ipairs(opts.finder.results) do labels[item.key] = item.label end
+    equal(labels.a, "Copy for AI")
+    equal(labels.f, "Show changed files")
+    equal(labels.d, "Read changes (all files)")
+    equal(labels.n, "Read saved notes (all files)")
+    equal(labels.C, "Commit staged changes (all files)")
+    equal(labels.P, "Push this branch")
+    equal(labels.p, "Open pull request")
+    equal(labels.z, "Undo last review action")
     open(2, 3)
     press("ny")
     equal(registers['"'], { { "two", "three" }, "V" })
@@ -136,8 +149,8 @@ local ok, err = xpcall(function()
     c.github = true
     vim.bo[buf].buftype = "nofile"
     open()
-    assert(#opts.finder.results == 8 and not maps.ns and not maps.ny)
-    assert(opts.prompt_title == "Redline | repo: " .. root)
+    assert(#opts.finder.results == 7 and not maps.ns and not maps.ny and not maps.na)
+    assert(opts.prompt_title == "Redline | Project: " .. root)
     vim.bo[buf].buftype = ""
 
     -- Missing Telescope uses the identical registry and scope, without another prompt.
@@ -146,7 +159,7 @@ local ok, err = xpcall(function()
     local fallback_calls = 0
     vim.ui.select = function(items, options, callback)
         fallback_calls = fallback_calls + 1
-        assert(#items == 14 and options.prompt:find("selected lines 2-3", 1, true))
+        assert(#items == 14 and options.prompt:find("Lines 2-3", 1, true))
         assert(options.format_item(items[1]) == "[s] Stage selected lines 2-3")
         callback(items[1])
     end

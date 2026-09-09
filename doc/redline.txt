@@ -54,10 +54,16 @@ MAPPINGS                                                   *redline-mappings*
   <leader>ha     whole-file actions               selected-line actions
   <leader>hc     add/edit whole-file note         add/edit selection note
   <leader>hv     toggle viewed: file changes      selected changes
+  <leader>hb     back to Changes after opening a file
   ]h / [h       next / previous changed location
   <leader>h?     help
 
 Selections are line-based, even when characterwise or blockwise.
+The hb mapping honors keymaps=false and is added only if it does not conflict
+with an existing mapping. Without it, use:
+>
+    :lua require('redline').back_to_review()
+<
 
 ==============================================================================
 ACTIONS                                                     *redline-actions*
@@ -67,24 +73,25 @@ ACTIONS                                                     *redline-actions*
 runs the selected row. Esc closes in either mode; normal q also closes.
 / searches actions, not the diff. Without Telescope, choose via vim.ui.select.
 
-  s  Stage       selection, otherwise whole file
-  u  Unstage     selection, otherwise whole file
-  c  Comment     selection, otherwise whole file (local note)
-  v  Viewed      selection, otherwise whole file
-  y  Copy        selection, otherwise whole file (live buffer lines)
-  h  Select chunk at cursor in this file
+  s  Stage          selection, otherwise whole file
+  u  Unstage        selection, otherwise whole file
+  c  Comment        selection, otherwise whole file (local note)
+  v  Toggle viewed  selection, otherwise whole file
+  y  Copy           selection, otherwise whole file (live buffer lines)
+  h  Select chunk at cursor (file)
 
-  f  Files       repo overview
-  d  Diff        repo disk snapshot
-  n  Notes       repo saved notes
-  a  AI handoff  whole repo: saved notes + disk diff
-  C  Commit      repo index, not the selection/file
-  P  Push        repo branch
-  p  PR          repo: open or create in browser (when GitHub enabled)
-  z  Undo        session's last Redline action, not limited to this file/repo
+  f  Show changed files
+  d  Read changes (all files)           saved-file diff
+  n  Read saved notes (all files)       saved local notes
+  a  Copy for AI                       selection, otherwise current file
+  C  Commit staged changes (all files)  repo index, not the selection/file
+  P  Push this branch
+  p  Open pull request                 when GitHub enabled
+  z  Undo last review action           not limited to this file/repo
 
-Local actions, code copy, handoff, and undo have no confirmation step. Comment
-asks for note text; empty input deletes the note at that range's start.
+Stage, Unstage, Comment, Toggle viewed, and Copy labels show "file" or
+"selected lines X-Y". Local actions, copying, and undo have no confirmation step.
+Comment asks for note text; empty input deletes the note at that range's start.
 
 For a chunk: place the cursor inside it, open <leader>ha, press h, then open
 Visual <leader>ha and choose an action. h only selects the review chunk's live
@@ -154,15 +161,40 @@ disables GitHub features, including action p.
 ==============================================================================
 DIFF AND COPYING                                              *redline-copy*
                                                       *redline-long-deletions*
-:Redline diff or action d opens a read-only repo disk snapshot: / searches added
-and removed text, n/N move between matches, q closes. It includes untracked
-files and Git's no-final-newline markers, but excludes unsaved buffers. Use it
-to read long deletions truncated in the overlay. Action y copies live buffer
-lines, not virtual removed code or PR comments.
+:Redline diff or d (Read changes (all files)) opens Changes in a read-only,
+full-screen tab. It compares saved files with the review base, includes
+untracked files and no-final-newline markers, and leaves out .comments.txt and
+unsaved edits. Use it to read long deletions cut short in the overlay.
 
-Action a copies the whole repo's saved notes, context, base, and disk diff to
-the unnamed register and available clipboard, without confirmation. It never
-executes an agent. Check for secrets before sharing.
+  /          Search text; n/N move between matches.
+  ]h / [h    Next / previous diff hunk.
+  Enter      Map the saved diff line to its live source position. If that line
+             changed or was deleted, use a nearby surviving line and warn
+             "Approximate location". Binary or encoded text also warns when
+             mapping is unsafe. Missing or deleted files stay in the diff.
+  ?          Open Help.
+  q / Esc    Back: close Changes or Help and return to where you opened it.
+
+Changes and Help each use a full-screen tab and preserve your existing splits.
+Changes stays open when Enter takes you to a source file. Use <leader>hb to
+return directly, then q/Esc for Back. It prefers the last review used from that
+source window, then the most recently visited open review. gt/gT still cycle
+through tabs.
+
+Action y (Copy) copies live buffer lines only, not removed text or comments.
+Action a (Copy for AI) copies changes from the review base to the live buffer,
+plus local notes and currently loaded PR review comments. It covers only the
+selected lines or the current file, never the whole repo. A selection also
+includes its live code; whole-file copy leaves out unchanged code.
+
+Copy for AI reads fresh saved notes, including external edits, and uses their
+tracked live positions when available. It does not save code or write notes.
+Selection copy includes overlapping notes and PR comments that can be matched
+to those lines, and reports any omitted because their positions are uncertain.
+Whole-file copy includes them, with saved or unavailable positions marked.
+Both copy actions use the unnamed register and try the clipboard, without
+confirmation. Copy for AI does not run an agent or send anything automatically.
+Check for secrets before sharing.
 
 UNDO                                                          *redline-undo*
 

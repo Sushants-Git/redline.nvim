@@ -1627,7 +1627,7 @@ end
 -- diff_hunk is the slice of the diff the comment is anchored to; it is what
 -- makes the preview show the code being talked about, not just the prose
 local GH_JQ = ".[] | {path, line, original_line, body, author: .user.login, " ..
-    "url: .html_url, diff_hunk, resolved: false}"
+    "url: .html_url, diff_hunk, start_line, side, start_side, commit_id, resolved: false}"
 
 -- With no arguments this is "the PR for the branch I am on". Pass a number to
 -- pull the comments off any other PR in this repo.
@@ -1955,6 +1955,7 @@ end
 -- ─────────────────────────────
 
 function M.help() require("redline.workflow").help() end
+M.back_to_review = require("redline.view").return_to_review
 
 -- ─────────────────────────────
 -- staging
@@ -2418,9 +2419,9 @@ function M.pick()
     end
     local ref = default_branch(root)
     vim.ui.select({
-        { mode = "worktree", label = "Uncommitted vs HEAD" },
-        { mode = "commit", label = "Latest commit + uncommitted vs HEAD~1" },
-        { mode = "branch", label = "Branch / PR diff vs " .. (ref or "default branch unavailable (falls back to HEAD)") },
+        { mode = "worktree", label = "Uncommitted changes" },
+        { mode = "commit", label = "Latest commit and uncommitted changes" },
+        { mode = "branch", label = "Changes on this branch (compared with " .. (ref or "the latest commit; default branch not found") .. ")" },
     }, {
         prompt = "redline: what do you want to see?",
         format_item = function(item) return item.label end,
@@ -2445,6 +2446,123 @@ function M.workflow_context(root)
     if not root then return end
     return { root = root, base = base_rev(root), mode = state.mode,
         default_branch = default_branch(root), github = state.gh_enabled }
+end
+
+function M.review_context(buf, first, last)
+    buf = (buf == nil or buf == 0) and api.nvim_get_current_buf() or buf
+    if not api.nvim_buf_is_loaded(buf) or vim.bo[buf].buftype ~= "" then
+        error("open a file to copy review context")
+    end
+    local root = get_root(buf)
+    local rel = root and relpath(root, buf)
+    if not rel or rel == NOTES_FILE then error("open a repository code file") end
+    local selected, total = first ~= nil, api.nvim_buf_line_count(buf)
+    if selected then
+        last = last or first
+        first, last = math.min(first, last), math.max(first, last)
+        if first < 1 or last > total then error("invalid selection") end
+    else first, last = 1, total end
+    -- Resolve again: HEAD and the merge base may have changed since rendering.
+    state.rev[root] = nil
+    local rev = base_rev(root)
+    local resolved = git(root, { "rev-parse", "--verify", rev .. "^{tree}" })
+    if not resolved then
+        if rev == "HEAD" and not git(root, { "rev-parse", "--verify", "HEAD" }) then
+            rev = EMPTY_TREE
+        else error("review base is unavailable") end
+    end
+    local base = git(root, { "cat-file", "blob", rev .. ":" .. rel }) or ""
+    local current = buf_text(buf)
+    local missing = not uv.fs_stat(api.nvim_buf_get_name(buf))
+    if missing and not selected and not vim.bo[buf].modified and base ~= "" then current = "" end
+    local result = { root = root, file = rel, base = rev, selected = selected,
+        first = first, last = last, lines = {}, changes = {}, notes = {}, comments = {}, omitted = 0 }
+    if selected and current ~= "" then result.lines = api.nvim_buf_get_lines(buf, first - 1, last, false) end
+    local old, new = split(base), split(current)
+    for _, h in ipairs(vim.diff(base, current, { result_type = "indices", ctxlen = 0 }) or {}) do
+        local a, ac, b, bc = unpack(h)
+        local lo, hi = b, b + bc - 1
+        if not selected or (bc == 0 and first <= b + 1 and last >= math.max(1, b))
+            or (bc > 0 and first <= hi and last >= lo) then
+            if selected and bc > 0 then
+                lo, hi = math.max(first, lo), math.min(last, hi)
+                -- Pair replacement lines by offset; never copy unselected new lines.
+                local offset = lo - b
+                local count = hi - lo + 1
+                a, ac = a + math.min(offset, ac), math.min(count, math.max(0, ac - offset))
+                if lo == b and hi == b + bc - 1 then a, ac = h[1], h[2] end
+                b, bc = lo, count
+            end
+            local chunk = { string.format("@@ -%d,%d +%d,%d @@", a, ac, b, bc) }
+            for i = a, a + ac - 1 do
+                chunk[#chunk + 1] = "-" .. old[i]
+                if i == #old and base:sub(-1) ~= "\n" then chunk[#chunk + 1] = "\\ No newline at end of file" end
+            end
+            for i = b, b + bc - 1 do
+                chunk[#chunk + 1] = "+" .. new[i]
+                if i == #new and current:sub(-1) ~= "\n" then chunk[#chunk + 1] = "\\ No newline at end of file" end
+            end
+            result.changes[#result.changes + 1] = table.concat(chunk, "\n")
+        end
+    end
+    -- Copy is read-only. Reconcile fresh saved notes with existing live anchors,
+    -- without refreshing the cache or persisting positions from unsaved code.
+    local saved, ranges = read_notes_file(root)
+    local cached = (state.notes[root] or {})[rel] or {}
+    local anchors, counts = {}, {}
+    for _, text in pairs(cached) do counts[text] = (counts[text] or 0) + 1 end
+    for id, text in pairs(state.note_ids[buf] or {}) do
+        local pos = api.nvim_buf_get_extmark_by_id(buf, ns_note, id, { details = true })
+        if #pos > 0 then
+            if anchors[text] ~= nil then anchors[text] = false
+            else
+                local lo = math.min(total, pos[1] + 1)
+                anchors[text] = { lo, math.max(lo, math.min(total, pos[3].end_row or lo)) }
+            end
+        end
+    end
+    result.notes_omitted = 0
+    for line, text in pairs(saved[rel] or {}) do
+        local finish = (ranges[rel] or {})[line] or line
+        local anchor = counts[text] == 1 and cached[line] == text
+            and note_end(root, rel, line) == finish and anchors[text]
+        local uncertain = not anchor and vim.bo[buf].modified
+        if anchor then line, finish = anchor[1], anchor[2] end
+        if selected and uncertain then
+            result.notes_omitted = result.notes_omitted + 1
+        elseif not selected or (line <= last and finish >= first) then
+            result.notes[#result.notes + 1] = { first = line, last = finish, body = text,
+                position_warning = uncertain or nil }
+        end
+    end
+    table.sort(result.notes, function(a, b) return a.first < b.first end)
+    for _, item in ipairs((state.gh[root] or {}).items or {}) do
+        if item.path == rel then
+            local line = type(item.line) == "number" and item.line or nil
+            local start = type(item.start_line) == "number" and item.start_line or line
+            local mapped = line and start >= 1 and start <= line and item.side == "RIGHT"
+                and (type(item.start_line) ~= "number" or item.start_side == "RIGHT")
+                and type(item.commit_id) == "string"
+            local head = mapped and git(root, { "cat-file", "blob", item.commit_id .. ":" .. rel })
+            mapped = head ~= nil and head ~= false
+            local shift = 0
+            if mapped then
+                for _, h in ipairs(vim.diff(head, current, { result_type = "indices" }) or {}) do
+                    local a, ac, _, bc = unpack(h)
+                    if (ac == 0 and a >= start and a < line)
+                        or (ac > 0 and a <= line and a + ac - 1 >= start) then mapped = false; break end
+                    if a < start then shift = shift + bc - ac end
+                end
+            end
+            if mapped then start, line = start + shift, line + shift end
+            if not selected or (mapped and start <= last and line >= first) then
+                result.comments[#result.comments + 1] = { first = mapped and start or nil,
+                    last = mapped and line or nil, body = item.body, author = item.author,
+                    outdated = not item.line or item.line == vim.NIL }
+            elseif not mapped then result.omitted = result.omitted + 1 end
+        end
+    end
+    return result
 end
 
 -- hh is the only entry point: it asks the question on the press that turns the
@@ -3210,6 +3328,9 @@ function M.setup(opts)
             M.actions(a, b)
         end, { desc = "Redline: selection actions" })
         map("n", "<leader>h?", M.help, { desc = "Redline: help" })
+        if vim.fn.mapcheck((vim.g.mapleader or "\\") .. "hb", "n") == "" then
+            map("n", "<leader>hb", M.back_to_review, { desc = "Redline: Back to changes" })
+        end
         map("n", "]h", function() M.next_hunk(false) end, { desc = "Diff: next changed line" })
         map("n", "[h", function() M.next_hunk(true) end, { desc = "Diff: prev changed line" })
         map("n", "<leader>hv", function() M.toggle_viewed(1, api.nvim_buf_line_count(0)) end, { desc = "Viewed: toggle whole file" })

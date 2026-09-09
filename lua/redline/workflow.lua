@@ -48,52 +48,80 @@ local function browser(c, url)
         vim.defer_fn(check, 50)
     end
 end
-local function scratch(c, title, text, ft)
-    vim.cmd("new")
-    local b = api.nvim_get_current_buf()
-    vim.bo[b].buftype, vim.bo[b].bufhidden, vim.bo[b].swapfile = "nofile", "wipe", false
-    vim.b[b].redline_root = c and c.root or nil
-    api.nvim_buf_set_lines(b, 0, -1, false, vim.split(title .. "\n\n" .. text, "\n", { plain = true }))
-    vim.bo[b].filetype, vim.bo[b].modifiable = ft or "text", false
-    vim.keymap.set("n", "q", "<cmd>close<CR>", { buffer = b })
-end
-
 -- Preserve Git's byte-level newline semantics and NUL-delimited filenames.
 function W.snapshot(c)
-    local base = c.base
-    if base == "HEAD" and not pcall(git, c, { "rev-parse", "--verify", "HEAD" }) then
-        base = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
-    end
-    local text = git(c, { "diff", "--no-ext-diff", "--no-textconv", "--no-color", base, "--", ".", ":(exclude).comments.txt" })
-    for _, path in ipairs(vim.split(git(c, { "ls-files", "--others", "--exclude-standard", "-z" }), "\0", { plain = true, trimempty = true })) do
-        if path ~= ".comments.txt" then
-            text = text .. git(c, { "diff", "--no-index", "--no-ext-diff", "--no-textconv", "--no-color", "--", "/dev/null", path }, true)
-        end
-    end
-    local resolved = vim.trim(git(c, { "rev-parse", "--verify", base }))
-    return "Review context: " .. c.mode .. "\nBase: " .. base .. " (" .. resolved .. ")"
-        .. "\nDISK SNAPSHOT: includes untracked files; excludes unsaved buffers.\n\n" .. text
+    return require("redline.diff").snapshot(c)
 end
 function W.diff(c)
     c = c or context()
     if not c then return end
-    local ok, text = pcall(W.snapshot, c)
+    local ok, text, metadata = pcall(W.snapshot, c)
     if not ok then return say(tostring(text)) end
-    scratch(c, "Redline diff | / search | n/N next/previous | q close", text, "diff")
+    local view = require("redline.view")
+    local b = view.open(c, "Redline diff", vim.split(text, "\n", { plain = true }),
+        { filetype = "diff", hints = "Enter Open file   / Search   ? Help   q Back" })
+    local offset = api.nvim_buf_line_count(b) - #vim.split(text, "\n", { plain = true })
+    vim.keymap.set("n", "<CR>", function()
+        local target = metadata.rows[api.nvim_win_get_cursor(0)[1] - offset]
+        if not target then return say("Choose a changed file or diff line to open it") end
+        if target.deleted then return say("This file was deleted. Stay here to review its removed lines.") end
+        local mapped, line, notice = pcall(require("redline.diff").live_line,
+            metadata.saved[target.path], target.path, target.line)
+        if not mapped then return say("Cannot map this saved line: " .. tostring(line)) end
+        if notice then say(notice) end
+        if line then view.jump(b, target.path, line) end
+    end, { buffer = b })
+    vim.keymap.set("n", "?", function() W.help() end, { buffer = b })
+    for key, direction in pairs({ ["]h"] = 1, ["[h"] = -1 }) do
+        vim.keymap.set("n", key, function()
+            local row = api.nvim_win_get_cursor(0)[1]
+            for n = 1, #metadata.hunks do
+                local h = metadata.hunks[direction == 1 and n or #metadata.hunks - n + 1] + offset
+                if (h - row) * direction > 0 then return api.nvim_win_set_cursor(0, { h, 0 }) end
+            end
+        end, { buffer = b })
+    end
 end
-function W.handoff(c)
-    c = c or context()
-    if not c then return end
-    local ok, text = pcall(W.snapshot, c)
-    if not ok then return say(tostring(text)) end
-    local file = io.open(c.root .. "/.comments.txt", "rb")
-    local notes = file and file:read("*a") or "(no saved notes)"
-    if file then file:close() end
-    text = "Review handoff (no agent executed)\n\nSaved review notes:\n" .. notes .. "\n\n" .. text
+function W.copy_for_ai(c, bufnr, first, last)
+    local ok, review = pcall(R().review_context, bufnr, first, last)
+    if not ok then return say(tostring(review)) end
+    if c and c.root ~= review.root then return say("review target changed; reopen actions") end
+    local lines = { "Please address these review comments. Keep changes within the scope below.",
+        "File: " .. review.file, "Base: " .. review.base,
+        review.selected and ("Lines " .. review.first .. "-" .. review.last .. ": " .. review.file)
+            or ("Whole file: " .. review.file) }
+    if review.selected then
+        lines[#lines + 1] = "\nSelected lines (live buffer):"
+        for i, line in ipairs(review.lines) do lines[#lines + 1] = (review.first + i - 1) .. ": " .. line end
+    end
+    lines[#lines + 1] = "\nRelevant changes (base -> live buffer; clipped to scope):"
+    lines[#lines + 1] = #review.changes > 0 and table.concat(review.changes, "\n")
+        or "No changes in this scope. Unchanged file content is omitted; select lines to include code context."
+    lines[#lines + 1] = "\nLocal review comments:"
+    for _, note in ipairs(review.notes) do
+        lines[#lines + 1] = string.format("Lines %d-%d%s: %s", note.first, note.last,
+            note.position_warning and " (saved position; cannot map to unsaved buffer)" or "", note.body)
+    end
+    if #review.notes == 0 then lines[#lines + 1] = "None in this scope." end
+    if review.notes_omitted > 0 then
+        lines[#lines + 1] = review.notes_omitted .. " same-file saved note(s) omitted: cannot map to selected lines in unsaved buffer."
+    end
+    lines[#lines + 1] = "\nGitHub review comments (currently loaded):"
+    for _, comment in ipairs(review.comments) do
+        local position = comment.first and string.format("Lines %d-%d", comment.first, comment.last)
+            or (comment.outdated and "Outdated; current position unavailable" or "Current position unavailable")
+        lines[#lines + 1] = position .. " | @" .. (comment.author or "unknown") .. ": " .. (comment.body or "")
+    end
+    if #review.comments == 0 then lines[#lines + 1] = "None in this scope." end
+    if review.omitted > 0 then
+        lines[#lines + 1] = review.omitted .. " same-file GitHub comment(s) omitted: outdated or cannot map to selected lines."
+    end
+    local text = table.concat(lines, "\n")
     vim.fn.setreg('"', text)
     pcall(vim.fn.setreg, "+", text)
-    say("handoff copied to unnamed register and available clipboard")
+    say("Copied for AI. Paste into your AI tool. Check for secrets before sharing.")
 end
+W.handoff = W.copy_for_ai
 function W.commit(c)
     c = c or context()
     if not c then return end
@@ -171,7 +199,7 @@ function W.open_target(root, file, line, menu)
     if file:sub(1, #root + 1) ~= root .. "/" or file:find("/../", 1, true) then return say("invalid review target") end
     local stat = (vim.uv or vim.loop).fs_stat(file)
     if not stat or stat.type ~= "file" then
-        say("File is absent/deleted: showing disk diff. File mutations are unavailable.")
+        say("This file was deleted or moved. Opening Changes so you can still read it.")
         local c = R().workflow_context(root)
         if c then W.diff(c) end
         return
@@ -203,15 +231,15 @@ function W.actions(first, last)
     first, last = math.min(first, last), math.max(first, last)
     if first < 1 or last > total then return say("invalid selection; reopen actions") end
     local stat = (vim.uv or vim.loop).fs_stat(file)
-    local is_file = vim.bo[buf].buftype == "" and file:sub(1, #c.root + 1) == c.root .. "/"
-        and stat and stat.type == "file"
+    local is_target = vim.bo[buf].buftype == "" and file:sub(1, #c.root + 1) == c.root .. "/"
+    local is_file = is_target and stat and stat.type == "file"
     local scope = selected and ("selected lines " .. first .. "-" .. last) or "file"
     local items = {}
     local function add(key, label, fn, local_action)
         items[#items + 1] = { key = key, label = label, run = function()
             if not api.nvim_win_is_valid(win) or not api.nvim_buf_is_loaded(buf)
                 or api.nvim_win_get_buf(win) ~= buf or api.nvim_buf_get_name(buf) ~= file then
-                return say("origin no longer available; reopen actions")
+                return say("The original file window was closed or changed. Open Actions again.")
             end
             if api.nvim_buf_get_changedtick(buf) ~= tick then
                 return say("buffer changed; reopen actions for the current selection")
@@ -228,7 +256,7 @@ function W.actions(first, last)
             -- Enter-window autocmds may have changed the target during restoration.
             if api.nvim_get_current_win() ~= win or api.nvim_get_current_buf() ~= buf
                 or api.nvim_buf_get_changedtick(buf) ~= tick or api.nvim_buf_get_name(buf) ~= file then
-                return say("origin changed; reopen actions")
+                return say("The file changed while opening Actions. Open Actions again.")
             end
             fn()
         end }
@@ -241,7 +269,7 @@ function W.actions(first, last)
             if selected then r.unstage(first, last) else r.unstage_file() end
         end, true)
         add("c", "Comment " .. scope, function() r.add_note(first, last) end, true)
-        add("v", "Viewed: toggle " .. scope, function() r.toggle_viewed(first, last) end, true)
+        add("v", "Toggle viewed " .. scope, function() r.toggle_viewed(first, last) end, true)
         add("y", "Copy " .. scope, function()
             local lines = api.nvim_buf_get_lines(buf, first - 1, last, false)
             vim.fn.setreg('"', lines, "V")
@@ -250,44 +278,71 @@ function W.actions(first, last)
         end, true)
         add("h", "Select chunk at cursor (file)", function() r.select_hunk() end, true)
     end
-    add("f", "Files (repo)", function() r.overview(c.root) end)
-    add("d", "Diff (repo disk snapshot)", function() W.diff(c) end)
-    add("n", "Notes (repo)", function() r.open_notes(c.root) end)
-    add("z", "Undo last Redline action (session; not publishing)", r.undo)
-    add("a", "AI handoff (whole repo: saved notes + disk diff)", function() W.handoff(c) end)
-    add("C", "Commit (repo index)", function() W.commit(c) end)
-    add("P", "Push (repo branch)", function() W.push(c) end)
-    if c.github then
-        add("p", "PR (repo: open or create in browser)", function() W.pr(c) end)
+    add("f", "Show changed files", function() r.overview(c.root) end)
+    add("d", "Read changes (all files)", function() W.diff(c) end)
+    add("n", "Read saved notes (all files)", function() r.open_notes(c.root) end)
+    add("z", "Undo last review action", r.undo)
+    if is_target then
+        add("a", "Copy for AI", function() W.copy_for_ai(c, buf, selected and first or nil, selected and last or nil) end)
     end
-    require("redline.picker").actions(items, "Redline | " .. (is_file
-        and (scope .. ": " .. file:sub(#c.root + 2)) or ("repo: " .. c.root)))
+    add("C", "Commit staged changes (all files)", function() W.commit(c) end)
+    add("P", "Push this branch", function() W.push(c) end)
+    if c.github then
+        add("p", "Open pull request", function() W.pr(c) end)
+    end
+    require("redline.picker").actions(items, "Redline | " .. (is_target
+        and ((selected and ("Lines " .. first .. "-" .. last) or "Whole file") .. ": " .. file:sub(#c.root + 2)) or ("Project: " .. c.root)))
 end
 function W.help()
-    scratch(R().workflow_context(), "Redline | q close", table.concat({
-        "<leader>ho / :Redline   Choose context, then overview",
-        "<leader>ha             Actions (normal / visual)",
-        "<leader>hc             Add/edit note (normal / visual)",
-        "<leader>hv             Toggle viewed (normal / visual)",
-        "]h / [h                Next / previous hunk",
-        "<leader>h?             Help",
-        "Telescope: Enter open; C-a / normal a actions; normal ? help",
-        "Split overview: Enter open; a actions; ? help; q close",
-        ":Redline diff          Disk diff including untracked; / searches real text",
-        "Disk diff / handoff exclude unsaved buffers; overlays use live buffers.",
-        "Absent/deleted targets open the disk diff, never an empty editable file.",
-        "Actions start in normal mode: press a row's letter to run immediately.",
-        "/ enters fuzzy search; Enter runs selected; Esc closes in either mode; normal q closes.",
-        "s Stage | u Unstage | c Comment | v Viewed | y Copy | h Select chunk at cursor",
-        "Normal ha targets the whole file; visual ha targets the selected line range.",
-        "h selects a chunk; open visual ha to act on those lines. Copy uses live buffer lines.",
-        "Repo: f Files | d Diff | n Notes | a AI handoff | C Commit | P Push | p PR",
-        "z undoes the session's last Redline action, without confirmation (not commit/push/PR).",
-        "Local actions and code copy do not ask for confirmation. / searches, not Diff.",
-        "PR opens an existing PR or browser creation; it never pushes. Publishing cannot be undone.",
-        "Handoff copies the whole repo's saved notes and disk diff, never executes an agent.",
-        "Without Telescope, the same actions are available through vim.ui.select.",
-        "setup({ keymaps = false }) disables default mappings.",
-    }, "\n"))
+    local leader = vim.g.mapleader or "\\"
+    leader = leader == " " and "Space " or vim.fn.keytrans(leader)
+    local lines, marks = {}, {}
+    local function section(title)
+        if #lines > 0 then lines[#lines + 1] = "" end
+        marks[#marks + 1] = { row = #lines + 3, group = "Title", length = #title }
+        lines[#lines + 1] = title
+    end
+    local function key(k, text)
+        marks[#marks + 1] = { row = #lines + 3, group = "Special", length = #k + 2 }
+        lines[#lines + 1] = "  " .. k .. string.rep(" ", math.max(2, 22 - vim.fn.strdisplaywidth(k))) .. text
+    end
+    local function note(text)
+        marks[#marks + 1] = { row = #lines + 3, group = "Comment", length = #text + 2 }
+        lines[#lines + 1] = "  " .. text
+    end
+    section("Start")
+    key(leader .. "ho", "Choose what to review")
+    key(leader .. "ha", "Actions for this file or selected lines")
+    key(leader .. "h?", "This guide")
+    section("Review")
+    key("s / u", "Stage / unstage from Actions")
+    key(leader .. "hc", "Add or edit a comment")
+    key(leader .. "hv", "Mark as viewed, or unmark")
+    key("h / z", "Select a chunk / undo from Actions")
+    note("Select lines first to act on just those lines.")
+    note("Undo reverses the last Redline action anywhere in this session.")
+    section("Move")
+    key("]h / [h", "Next / previous change")
+    key("f / d / n", "Files / Changes / Local notes from Actions")
+    key("Enter / ?", "Open file / Help in review lists")
+    key("/", "Search; Enter chooses an action")
+    key("q / Esc", "Back from Help or Changes")
+    key(leader .. "hb", "Back to Changes after opening a file")
+    note("Changes stays open in its own tab. gt / gT also switches tabs.")
+    note("Changes shows saved files, including new files, not unsaved edits.")
+    section("Share")
+    key("y / a", "Copy code / Copy for AI from Actions")
+    note("Copy for AI includes this file or selected lines, plus comments.")
+    key("C / P / p", "Commit staged changes / Push / Open PR from Actions")
+    note("Opening a PR never pushes. Undo does not undo a commit or push.")
+    local buf, win = require("redline.view").open(R().workflow_context(), "Redline", lines,
+        { hints = "Review at your pace.   q Back   Esc Back" })
+    if not buf then return end
+    local ns = api.nvim_create_namespace("redline.help")
+    for _, mark in ipairs(marks) do
+        api.nvim_buf_set_extmark(buf, ns, mark.row, 0,
+            { end_col = mark.length, hl_group = mark.group })
+    end
+    return buf, win
 end
 return W
