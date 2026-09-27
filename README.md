@@ -65,6 +65,13 @@ buffer, unsaved edits included, with Redline's staged/viewed/note marks; inline
 removed code is hidden meanwhile. The left window follows whichever file you
 open on the right, and each tab gets its own pair.
 
+Lines are aligned one by one, like a GitHub split diff: removed lines are red
+on the left, added lines green on the right, changed words are shaded
+stronger, and a line only one side has gets a hatched `╱` gap on the other.
+While a pair is open Redline sets `diffopt` to histogram with a large
+`linematch`, and restores yours afterwards. Diff colours outrank line
+backgrounds there, so staged/viewed state on changed lines shows in the sign.
+
 Press `<leader>hs` again, or close the left window, to go back to unified.
 Opening a review resets the layout to the `layout` option. `:Redline split` and
 `:Redline unified` set it directly.
@@ -219,7 +226,9 @@ the default mappings.
 
 Highlights: `RedlineAdd`, `RedlineChange`, `RedlineDelete`, `RedlineStaged`,
 `RedlineViewed`, `RedlineNote`, and `RedlineGh`, with `Ln` background and `Virt`
-virtual-line variants. Override them like normal highlight groups.
+virtual-line variants. Side by side also uses `RedlineAddText`,
+`RedlineDeleteText` (changed words) and `RedlineFiller` (gaps). Override them
+like normal highlight groups.
 
 ## License
 

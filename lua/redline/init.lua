@@ -103,18 +103,18 @@ local palette = {
     -- variants of the same colour -- "green vs slightly-duller green" is the
     -- one distinction the eye cannot make while scanning.
     dark = {
-        add    = { line = "#183d26", sign = "#4ade80" }, -- green
+        add    = { line = "#183d26", sign = "#4ade80", text = "#24673c" }, -- green
         change = { line = "#12324d", sign = "#60a5fa" }, -- blue
-        delete = { line = "#4a1d22", sign = "#f87171" }, -- red
+        delete = { line = "#4a1d22", sign = "#f87171", text = "#7a2b33" }, -- red
         staged = { line = "#463713", sign = "#fbbf24" }, -- amber
         viewed = { line = "#33302d", sign = "#a1a1aa" }, -- warm neutral, equidistant from all four hues
         note   = { line = "#3a2450", sign = "#d8b4fe" }, -- purple
         gh     = { line = "#0d3b40", sign = "#2dd4bf" }, -- teal, for PR review comments
     },
     light = {
-        add    = { line = "#c7f0d4", sign = "#15803d" },
+        add    = { line = "#c7f0d4", sign = "#15803d", text = "#8fdca8" },
         change = { line = "#c8e0fb", sign = "#1d4ed8" },
-        delete = { line = "#fbd0d3", sign = "#b91c1c" },
+        delete = { line = "#fbd0d3", sign = "#b91c1c", text = "#f5a3aa" },
         staged = { line = "#fbeec2", sign = "#a16207" },
         viewed = { line = "#e6e3df", sign = "#6b7280" },
         note   = { line = "#e9d5ff", sign = "#7e22ce" },
@@ -135,7 +135,11 @@ local function apply_highlights()
         api.nvim_set_hl(0, name, { fg = col.sign, bold = true })
         -- for glyphs drawn *inside* a painted virtual line
         api.nvim_set_hl(0, name .. "Virt", { fg = col.sign, bg = col.line, bold = true })
+        -- the changed words inside a changed line, side by side
+        if col.text then api.nvim_set_hl(0, name .. "Text", { bg = col.text }) end
     end
+    -- the gap opposite a line the other side does not have
+    api.nvim_set_hl(0, "RedlineFiller", { fg = vim.o.background == "light" and "#d4d4d8" or "#3f3f46" })
 end
 
 -- shape carries add/change/delete, colour carries staged/viewed -- so neither
@@ -2649,12 +2653,35 @@ M.cycle_deleted = M.toggle_deleted
 
 -- One pair per tabpage: the window you review in (src) and a read-only window
 -- on its left holding the base version (base). The pair follows whatever file
--- you open in src. Vim's own diff mode aligns them, so the right side keeps
--- redline's staged/viewed paint and the left side does the red.
-local panes = {} -- tabpage -> { src, base, buf, for_buf, text, winhl }
+-- you open in src. Vim's own diff mode aligns them and leaves a hatched gap
+-- opposite a line only one side has: red on the left, green on the right.
+-- Diff highlighting outranks sign line highlights, so on changed lines the
+-- staged/viewed state is carried by the sign alone.
+local panes = {} -- tabpage -> { src, base, buf, for_buf, text, winhl, fillchars }
 local closing = false -- set while redline closes its own windows
-local SRC_WINHL = "DiffAdd:None,DiffChange:None,DiffText:None"
-local BASE_WINHL = "DiffAdd:RedlineDeleteLn,DiffChange:RedlineDeleteLn,DiffText:RedlineDeleteVirt"
+local SRC_WINHL = "DiffAdd:RedlineAddLn,DiffChange:RedlineAddLn,DiffText:RedlineAddText,DiffDelete:RedlineFiller"
+local BASE_WINHL = "DiffAdd:RedlineDeleteLn,DiffChange:RedlineDeleteLn,DiffText:RedlineDeleteText,DiffDelete:RedlineFiller"
+local FILL = "diff:╱"
+
+-- 'diffopt' is global. While any pair is open, align line by line
+-- (histogram + a linematch big enough for real hunks) so a pure addition or
+-- deletion gets a gap on the other side instead of being paired with
+-- unrelated lines; the user's value comes back with the last pair.
+local saved_diffopt
+local function tune_diffopt()
+    if saved_diffopt then return end
+    saved_diffopt = vim.o.diffopt
+    local opts = { "filler" }
+    for _, o in ipairs(vim.split(saved_diffopt, ",", { trimempty = true })) do
+        if not o:match("^algorithm:") and not o:match("^linematch:") and o ~= "filler" then opts[#opts + 1] = o end
+    end
+    vim.list_extend(opts, { "algorithm:histogram", "linematch:1000" })
+    vim.o.diffopt = table.concat(opts, ",")
+end
+local function restore_diffopt()
+    if not saved_diffopt or next(panes) then return end
+    vim.o.diffopt, saved_diffopt = saved_diffopt, nil
+end
 
 local function reviewable(win)
     if not api.nvim_win_is_valid(win) or api.nvim_win_get_config(win).relative ~= "" then return end
@@ -2663,6 +2690,27 @@ local function reviewable(win)
     local root = get_root(bufnr)
     local rel = root and relpath(root, bufnr)
     if rel then return bufnr, root, rel end
+end
+
+-- Window options belong to the buffer being shown, so opening another file
+-- in src brings that file's own values back: diff off, no winhighlight.
+-- Remember those as what to restore, then dress the window again.
+local function dress(p)
+    local wins = { { p.base, BASE_WINHL }, { p.src, SRC_WINHL } }
+    for _, pair in ipairs(wins) do
+        local w, winhl = pair[1], pair[2]
+        if api.nvim_win_is_valid(w) and vim.wo[w].winhighlight ~= winhl then
+            if w == p.src then p.winhl, p.fillchars = vim.wo[w].winhighlight, vim.wo[w].fillchars end
+            vim.wo[w].winhighlight = winhl
+            local keep = vim.tbl_filter(function(o) return not o:match("^diff:") end,
+                vim.split(vim.wo[w].fillchars, ",", { trimempty = true }))
+            keep[#keep + 1] = FILL
+            vim.wo[w].fillchars = table.concat(keep, ",")
+        end
+        if api.nvim_win_is_valid(w) and not vim.wo[w].diff then
+            api.nvim_win_call(w, function() vim.cmd("diffthis") end)
+        end
+    end
 end
 
 local function fill_base(p, bufnr, root, rel)
@@ -2683,7 +2731,13 @@ local function fill_base(p, bufnr, root, rel)
     local ft = vim.bo[bufnr].filetype
     local lang = ft ~= "" and vim.treesitter.language.get_lang(ft)
     if not (lang and pcall(vim.treesitter.start, b, lang)) then vim.bo[b].syntax = ft end
+    -- a buffer that leaves the window stays in the tab's diff while hidden;
+    -- drop it, or it becomes a third side and the gaps stop making sense
+    if p.base and p.for_buf ~= bufnr and api.nvim_win_is_valid(p.src) then
+        api.nvim_win_call(p.src, function() vim.cmd("diffoff!") end)
+    end
     p.for_buf, p.text = bufnr, text
+    if p.base then dress(p) end
     if api.nvim_win_is_valid(p.src) then
         api.nvim_win_call(p.src, function() vim.cmd("diffupdate") end)
     end
@@ -2696,11 +2750,12 @@ local function close_pane(tab)
     closing = true
     if api.nvim_win_is_valid(p.src) then
         api.nvim_win_call(p.src, function() vim.cmd("diffoff") end)
-        vim.wo[p.src].winhighlight = p.winhl
+        vim.wo[p.src].winhighlight, vim.wo[p.src].fillchars = p.winhl, p.fillchars
     end
     if api.nvim_win_is_valid(p.base) then pcall(api.nvim_win_close, p.base, true) end
     if api.nvim_buf_is_valid(p.buf) then pcall(api.nvim_buf_delete, p.buf, { force = true }) end
     closing = false
+    restore_diffopt()
 end
 
 close_splits = function()
@@ -2713,15 +2768,12 @@ local function open_pane(win)
     local b = api.nvim_create_buf(false, true)
     vim.bo[b].bufhidden = "wipe"
     vim.b[b].redline_base = true
-    local p = { src = win, buf = b, winhl = vim.wo[win].winhighlight }
+    local p = { src = win, buf = b }
+    tune_diffopt()
     panes[api.nvim_win_get_tabpage(win)] = p
     fill_base(p, bufnr, root, rel)
     p.base = api.nvim_open_win(b, false, { split = "left", win = win })
-    vim.wo[p.base].winhighlight = BASE_WINHL
-    vim.wo[win].winhighlight = SRC_WINHL
-    for _, w in ipairs({ p.base, win }) do
-        api.nvim_win_call(w, function() vim.cmd("diffthis") end)
-    end
+    dress(p)
     return true
 end
 

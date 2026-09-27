@@ -153,6 +153,13 @@ viewed, and note marks on the live buffer, unsaved edits included. Inline
 removed code is hidden while it is on. The left window follows whichever file
 you open in the right one, and each tab gets its own pair.
 
+Lines are aligned one by one: removed lines are red on the left, added lines
+green on the right, changed words are shaded stronger, and a line only one
+side has gets a hatched gap on the other. While a pair is open Redline sets
+'diffopt' to histogram with a large linematch and restores yours afterwards.
+Diff colours outrank line backgrounds, so staged/viewed state on changed
+lines shows in the sign.
+
 Press <leader>hs again, or close the left window, to return to unified.
 Opening a review resets the layout to the layout option. :Redline split and
 :Redline unified set it directly.
@@ -234,6 +241,7 @@ HIGHLIGHTS                                              *redline-highlights*
 
 RedlineAdd, RedlineChange, RedlineDelete, RedlineStaged, RedlineViewed,
 RedlineNote, RedlineGh. Each has Ln background and Virt virtual-line variants.
+Side by side also uses RedlineAddText, RedlineDeleteText, and RedlineFiller.
 Override them like normal highlight groups.
 
 vim:tw=78:ts=8:ft=help:norl:

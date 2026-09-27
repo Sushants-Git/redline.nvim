@@ -32,6 +32,7 @@ local ok, err = xpcall(function()
     local del_ns = api.nvim_get_namespaces().redline_deleted
     assert(#api.nvim_buf_get_extmarks(a, del_ns, 0, -1, {}) > 0, "unified shows removed code inline")
 
+    vim.o.diffopt = "internal,closeoff,linematch:40"
     redline.set_layout("split")
     local wins = api.nvim_tabpage_list_wins(0)
     assert(#wins == 2, "base window opened")
@@ -45,11 +46,28 @@ local ok, err = xpcall(function()
     assert(#api.nvim_buf_get_extmarks(a, del_ns, 0, -1, {}) == 0, "no inline deletions side by side")
     assert(#api.nvim_buf_get_extmarks(a, api.nvim_get_namespaces().redline, 0, -1, {}) > 0, "marks kept")
 
+    -- line by line: the change pairs up, the pure addition gets a gap on the left
+    assert(vim.o.diffopt:find("linematch:1000", 1, true) and vim.o.diffopt:find("algorithm:histogram", 1, true))
+    assert(vim.wo[src].fillchars:find("diff:╱", 1, true))
+    local base_hl = api.nvim_win_call(base, function()
+        return { vim.fn.diff_hlID(2, 1), vim.fn.diff_filler(4) }
+    end)
+    local src_hl = api.nvim_win_call(src, function()
+        return { vim.fn.diff_hlID(2, 1), vim.fn.diff_hlID(4, 1), vim.fn.diff_filler(4) }
+    end)
+    assert(base_hl[1] ~= 0 and base_hl[2] == 1, "old 'two' changed, gap opposite 'four'")
+    assert(src_hl[1] ~= 0 and src_hl[2] ~= 0 and src_hl[3] == 0, "new 'TWO' changed, 'four' added")
+    assert(vim.wo[src].winhighlight:find("DiffAdd:RedlineAddLn", 1, true))
+    assert(vim.wo[base].winhighlight:find("DiffAdd:RedlineDeleteLn", 1, true))
+
     -- the pair follows the next file opened in the source window
     vim.cmd.edit(root .. "/b.txt")
     settle()
     assert(#api.nvim_tabpage_list_wins(0) == 2 and api.nvim_win_is_valid(base))
     assert(vim.deep_equal(api.nvim_buf_get_lines(bbuf, 0, -1, false), { "alpha", "beta" }))
+    -- a pure deletion leaves the gap on the right
+    assert(vim.wo[src].diff and vim.wo[src].winhighlight:find("RedlineAddLn", 1, true), "new file dressed too")
+    assert(api.nvim_win_call(src, function() return vim.fn.diff_filler(2) end) == 1)
 
     -- a new tab gets its own pair
     vim.cmd("tabnew " .. root .. "/a.txt")
@@ -62,6 +80,8 @@ local ok, err = xpcall(function()
     -- back to unified: base gone, diff off, deletions return
     redline.toggle_layout()
     assert(#api.nvim_tabpage_list_wins(0) == 1 and not vim.wo[src].diff)
+    assert(vim.o.diffopt == "internal,closeoff,linematch:40", "user diffopt restored")
+    assert(not vim.wo[src].fillchars:find("╱", 1, true) and vim.wo[src].winhighlight == "")
     assert(not api.nvim_buf_is_valid(bbuf))
     vim.cmd.edit(root .. "/a.txt")
     settle()
