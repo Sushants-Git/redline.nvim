@@ -46,13 +46,28 @@ come from disk, not unsaved buffers.
 | `<leader>hc` | add/edit a whole-file note | add/edit a selection note |
 | `<leader>hv` | toggle viewed for changed lines in the whole file | toggle viewed for selected changed lines |
 | `<leader>hb` | back to Changes after opening a file | |
+| `<leader>hs` | side-by-side diff, or back to unified | |
 | `]h` / `[h` | next / previous changed location | |
 | `<leader>h?` | help | |
 
 Redline does not set your leader. Set `keymaps = false` to disable default maps.
-The `hb` mapping is added only if it does not conflict with an existing mapping.
+The `hb` and `hs` mappings are added only if they do not conflict with existing mappings.
 Without it, use `:lua require('redline').back_to_review()`.
 Selections are line-based, including characterwise and blockwise selections.
+
+### Side by Side
+
+The overlay is **unified** by default: removed code is drawn inline, above the
+lines that replaced it. `<leader>hs` (or action `t`, or `:Redline layout`)
+switches to **side by side**: the base version opens read-only in a window on
+the left and Vim's diff mode lines the two up. The right side is still the live
+buffer, unsaved edits included, with Redline's staged/viewed/note marks; inline
+removed code is hidden meanwhile. The left window follows whichever file you
+open on the right, and each tab gets its own pair.
+
+Press `<leader>hs` again, or close the left window, to go back to unified.
+Opening a review resets the layout to the `layout` option. `:Redline split` and
+`:Redline unified` set it directly.
 
 ## Actions
 
@@ -69,6 +84,7 @@ also closes. `/` searches actions; it does not open the diff.
 | `v` | selection, otherwise file | Toggle viewed |
 | `y` | selection, otherwise file | Copy (live buffer lines) |
 | `h` | file, at cursor | Select chunk at cursor (file) |
+| `t` | session | Toggle side-by-side / unified diff |
 | `f` | repo | Show changed files |
 | `d` | repo | Read changes (all files) |
 | `n` | repo saved notes | Read saved notes (all files) |
@@ -190,13 +206,14 @@ require("redline").setup({
   keymaps = true,
   deletions = "all",     -- "all" | "cursor" | "off"; reset when opening review
   deleted_max = "auto",  -- inline deletion cap; number, or 0 for no cap
+  layout = "unified",    -- "unified" | "split" (side by side); reset when opening review
   comments = "cursor",  -- "off" | "cursor" | "all"; PR comment bodies
   github = true,
 })
 ```
 
 `:Redline` equals `:Redline open`. Command completion exposes only `open`,
-`actions`, `diff`, and `help`. Historical subcommands and Lua APIs remain
+`actions`, `diff`, `layout`, and `help`. Historical subcommands and Lua APIs remain
 available for existing configurations; their no-argument scopes may differ from
 the default mappings.
 

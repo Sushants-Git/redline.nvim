@@ -20,11 +20,13 @@ SETUP                                                         *redline-setup*
       keymaps = true,
       deletions = "all",     -- "all" | "cursor" | "off"
       deleted_max = "auto",  -- inline cap; number, or 0 for no cap
+      layout = "unified",    -- "unified" | "split" (side by side)
       comments = "cursor",  -- "off" | "cursor" | "all"; PR comment bodies
       github = true,
     })
 <
-Opening review resets removed-code visibility to the deletions option.
+Opening review resets removed-code visibility to the deletions option and
+the layout to the layout option.
 Redline does not set your leader; keymaps=false disables default mappings.
 
 ==============================================================================
@@ -55,12 +57,13 @@ MAPPINGS                                                   *redline-mappings*
   <leader>hc     add/edit whole-file note         add/edit selection note
   <leader>hv     toggle viewed: file changes      selected changes
   <leader>hb     back to Changes after opening a file
+  <leader>hs     side-by-side diff, or back to unified
   ]h / [h       next / previous changed location
   <leader>h?     help
 
 Selections are line-based, even when characterwise or blockwise.
-The hb mapping honors keymaps=false and is added only if it does not conflict
-with an existing mapping. Without it, use:
+The hb and hs mappings honor keymaps=false and are added only if they do not
+conflict with an existing mapping. Without it, use:
 >
     :lua require('redline').back_to_review()
 <
@@ -79,6 +82,7 @@ runs the selected row. Esc closes in either mode; normal q also closes.
   v  Toggle viewed  selection, otherwise whole file
   y  Copy           selection, otherwise whole file (live buffer lines)
   h  Select chunk at cursor (file)
+  t  Toggle side-by-side / unified diff  see |redline-layout|
 
   f  Show changed files
   d  Read changes (all files)           saved-file diff
@@ -138,6 +142,20 @@ GitHub's creation form if no PR exists. Finish creation in the browser; there
 are no local title/body/confirmation prompts. Lookup/auth/network errors are
 reported, not treated as a missing PR. It never pushes automatically: use P
 separately when needed. Redline cannot undo commit, push, or PR operations.
+
+Side by side                                                 *redline-layout*
+
+The overlay is unified by default: removed code is drawn inline, above the
+lines that replaced it. <leader>hs (or action t, or :Redline layout) switches
+to side by side: the base version opens read-only in a window on the left and
+Vim's diff mode lines the two up, while the right side keeps Redline's staged,
+viewed, and note marks on the live buffer, unsaved edits included. Inline
+removed code is hidden while it is on. The left window follows whichever file
+you open in the right one, and each tab gets its own pair.
+
+Press <leader>hs again, or close the left window, to return to unified.
+Opening a review resets the layout to the layout option. :Redline split and
+:Redline unified set it directly.
 
 ==============================================================================
 NOTES AND VIEWED                                             *redline-notes*
@@ -207,7 +225,7 @@ COMMANDS                                                  *redline-commands*
 
 :Redline equals :Redline open. Completion exposes only:
 >
-    open actions diff help
+    open actions diff layout help
 <
 Historical subcommands and Lua APIs remain available for existing configurations;
 their no-argument scopes may differ from the default mappings.

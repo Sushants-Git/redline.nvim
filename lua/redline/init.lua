@@ -58,6 +58,11 @@ local state = {
     -- a page-sized deletion is effectively unreachable in the buffer.
     -- "auto" = whatever fits the window; a number to fix it; 0 for no cap.
     deleted_max = "auto",
+    -- "unified" paints removed code inline; "split" puts the base version in a
+    -- window on the left and lets Vim's diff mode line the two up.
+    -- Opening a review resets it to layout_default, like deletions.
+    layout = "unified",
+    layout_default = "unified",
     roots = {},        -- bufnr -> root path | false
     base = {},         -- bufnr -> { rev = string, text = string }
     index = {},        -- bufnr -> string (contents of the file in the index)
@@ -85,6 +90,9 @@ local state = {
 
 -- git's hash of the empty tree; the base for a diff that has no parent commit
 local EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+
+-- defined with the side-by-side layout, below; refresh_all needs it first
+local sync_split, close_splits
 
 -- ─────────────────────────────
 -- colors
@@ -416,6 +424,8 @@ local function render_deletions(bufnr)
     if not api.nvim_buf_is_valid(bufnr) then return end
     api.nvim_buf_clear_namespace(bufnr, ns_del, 0, -1)
     if not state.enabled or state.show_deleted == "off" then return end
+    -- side by side, the base window on the left already shows removed code
+    if state.layout == "split" then return end
 
     local blocks = state.deletions[bufnr] or {}
     if #blocks == 0 then return end
@@ -1856,6 +1866,7 @@ local function refresh_all()
     -- already sitting in, so this is what catches the very first fetch
     gh_auto(api.nvim_get_current_buf())
     panels_refresh()
+    sync_split()
 end
 
 -- Turning it off must leave no trace in any buffer.
@@ -1870,6 +1881,7 @@ local function clear_all()
     end
     state.hunks, state.index_hunks, state.counts, state.note_ids = {}, {}, {}, {}
     state.deletions, state.del_key = {}, {}
+    close_splits()
 end
 
 -- Anything that needs the diff to exist switches it on rather than doing
@@ -2431,6 +2443,7 @@ function M.pick()
         -- momentary "get out of my way", not a preference worth remembering
         -- across a restart or the next time you open the diff.
         state.show_deleted = state.deletions_default
+        state.layout = state.layout_default
         state.base, state.index, state.rev = {}, {}, {}
         M.set_mode(choice.mode)
         M.overview(root)
@@ -2629,6 +2642,135 @@ end
 
 -- kept for :Redline deletions, which used to cycle
 M.cycle_deleted = M.toggle_deleted
+
+-- ─────────────────────────────
+-- side-by-side layout
+-- ─────────────────────────────
+
+-- One pair per tabpage: the window you review in (src) and a read-only window
+-- on its left holding the base version (base). The pair follows whatever file
+-- you open in src. Vim's own diff mode aligns them, so the right side keeps
+-- redline's staged/viewed paint and the left side does the red.
+local panes = {} -- tabpage -> { src, base, buf, for_buf, text, winhl }
+local closing = false -- set while redline closes its own windows
+local SRC_WINHL = "DiffAdd:None,DiffChange:None,DiffText:None"
+local BASE_WINHL = "DiffAdd:RedlineDeleteLn,DiffChange:RedlineDeleteLn,DiffText:RedlineDeleteVirt"
+
+local function reviewable(win)
+    if not api.nvim_win_is_valid(win) or api.nvim_win_get_config(win).relative ~= "" then return end
+    local bufnr = api.nvim_win_get_buf(win)
+    if vim.bo[bufnr].buftype ~= "" or vim.b[bufnr].redline_base then return end
+    local root = get_root(bufnr)
+    local rel = root and relpath(root, bufnr)
+    if rel then return bufnr, root, rel end
+end
+
+local function fill_base(p, bufnr, root, rel)
+    local text = base_text(bufnr, root, rel)
+    if p.for_buf == bufnr and p.text == text then return end
+    local lines = split(text)
+    if #lines > 1 and lines[#lines] == "" then lines[#lines] = nil end
+    local b = p.buf
+    vim.bo[b].modifiable = true
+    api.nvim_buf_set_lines(b, 0, -1, false, lines)
+    vim.bo[b].modifiable, vim.bo[b].modified = false, false
+    local name = ("redline://%s/%s"):format(base_rev(root):sub(1, 10), rel)
+    if not pcall(api.nvim_buf_set_name, b, name) then
+        pcall(api.nvim_buf_set_name, b, name .. " (" .. b .. ")")
+    end
+    -- highlight without setting 'filetype': that would attach LSP clients to
+    -- a scratch buffer and fill it with diagnostics for code that is gone
+    local ft = vim.bo[bufnr].filetype
+    local lang = ft ~= "" and vim.treesitter.language.get_lang(ft)
+    if not (lang and pcall(vim.treesitter.start, b, lang)) then vim.bo[b].syntax = ft end
+    p.for_buf, p.text = bufnr, text
+    if api.nvim_win_is_valid(p.src) then
+        api.nvim_win_call(p.src, function() vim.cmd("diffupdate") end)
+    end
+end
+
+local function close_pane(tab)
+    local p = panes[tab]
+    if not p then return end
+    panes[tab] = nil
+    closing = true
+    if api.nvim_win_is_valid(p.src) then
+        api.nvim_win_call(p.src, function() vim.cmd("diffoff") end)
+        vim.wo[p.src].winhighlight = p.winhl
+    end
+    if api.nvim_win_is_valid(p.base) then pcall(api.nvim_win_close, p.base, true) end
+    if api.nvim_buf_is_valid(p.buf) then pcall(api.nvim_buf_delete, p.buf, { force = true }) end
+    closing = false
+end
+
+close_splits = function()
+    for tab in pairs(panes) do close_pane(tab) end
+end
+
+local function open_pane(win)
+    local bufnr, root, rel = reviewable(win)
+    if not bufnr then return false end
+    local b = api.nvim_create_buf(false, true)
+    vim.bo[b].bufhidden = "wipe"
+    vim.b[b].redline_base = true
+    local p = { src = win, buf = b, winhl = vim.wo[win].winhighlight }
+    panes[api.nvim_win_get_tabpage(win)] = p
+    fill_base(p, bufnr, root, rel)
+    p.base = api.nvim_open_win(b, false, { split = "left", win = win })
+    vim.wo[p.base].winhighlight = BASE_WINHL
+    vim.wo[win].winhighlight = SRC_WINHL
+    for _, w in ipairs({ p.base, win }) do
+        api.nvim_win_call(w, function() vim.cmd("diffthis") end)
+    end
+    return true
+end
+
+-- Bring every pair in line with the layout: drop broken ones, follow a new
+-- file into src, and give the current tab a pair if it has none yet.
+sync_split = function()
+    if not state.enabled or state.layout ~= "split" then return close_splits() end
+    for tab, p in pairs(panes) do
+        if not api.nvim_win_is_valid(p.src) or not api.nvim_win_is_valid(p.base)
+            or api.nvim_win_get_buf(p.base) ~= p.buf then
+            close_pane(tab)
+        else
+            local bufnr, root, rel = reviewable(p.src)
+            -- something that is not a repo file (help, a terminal) took over
+            -- src: step aside, and come back with the next real file
+            if bufnr then fill_base(p, bufnr, root, rel) else close_pane(tab) end
+        end
+    end
+    local tab = api.nvim_get_current_tabpage()
+    if not panes[tab] then open_pane(api.nvim_get_current_win()) end
+end
+
+local LAYOUT_LABEL = {
+    unified = "unified diff",
+    split = "side by side (base on the left)",
+}
+
+function M.set_layout(layout)
+    if not LAYOUT_LABEL[layout] then
+        vim.notify("redline: layout must be 'unified' or 'split'", vim.log.levels.ERROR)
+        return
+    end
+    state.layout = layout
+    if not ensure_enabled() then sync_split() end
+    for _, b in ipairs(api.nvim_list_bufs()) do
+        if api.nvim_buf_is_loaded(b) then
+            state.del_key[b] = nil
+            render_deletions(b)
+        end
+    end
+    if layout == "split" and not panes[api.nvim_get_current_tabpage()] then
+        return M.legend("side by side: open a changed file to see it next to its base")
+    end
+    M.legend(LAYOUT_LABEL[layout])
+end
+
+function M.toggle_layout()
+    M.set_layout(state.layout == "split" and "unified" or "split")
+end
 
 -- Step back through the redline actions that touched the index, the viewed
 -- store or .comments.txt. Buffer text is not in here -- that is what `u` is for.
@@ -3145,6 +3287,10 @@ function M.setup(opts)
     -- opts.github = false stops redline from ever shelling out to gh
     if opts.github ~= nil then state.gh_enabled = opts.github end
     if opts.comments ~= nil then state.show_comments = opts.comments end
+    if opts.layout ~= nil then
+        state.layout_default = opts.layout
+        state.layout = opts.layout
+    end
 
     apply_highlights()
     api.nvim_create_autocmd("ColorScheme", {
@@ -3246,6 +3392,43 @@ function M.setup(opts)
         end,
     })
 
+    -- the side-by-side pair follows the file you open; scheduled so window
+    -- changes never happen inside someone else's BufEnter
+    local split_queued = false
+    api.nvim_create_autocmd({ "BufEnter", "BufWinEnter", "TabEnter" }, {
+        group = group,
+        callback = function()
+            if not state.enabled or state.layout ~= "split" or split_queued then return end
+            split_queued = true
+            vim.schedule(function()
+                split_queued = false
+                sync_split()
+            end)
+        end,
+    })
+
+    -- closing the base window yourself means "unified, please"
+    api.nvim_create_autocmd("WinClosed", {
+        group = group,
+        callback = function(e)
+            if closing then return end
+            local closed = tonumber(e.match)
+            for _, p in pairs(panes) do
+                if p.base == closed then
+                    -- :tabclose takes both windows; only a base closed on its
+                    -- own, with the source still open, is a request
+                    vim.schedule(function()
+                        if api.nvim_win_is_valid(p.src) then M.set_layout("unified") else sync_split() end
+                    end)
+                    return
+                elseif p.src == closed then
+                    vim.schedule(sync_split)
+                    return
+                end
+            end
+        end,
+    })
+
     api.nvim_create_autocmd("BufUnload", {
         group = group,
         callback = function(e) viewed_helpers.unload(e.buf) end,
@@ -3294,6 +3477,9 @@ function M.setup(opts)
             branch = function() M.set_mode("branch") end,
             reload = M.reload,
             deletions = M.cycle_deleted,
+            layout = M.toggle_layout,
+            split = function() M.set_layout("split") end,
+            unified = function() M.set_layout("unified") end,
             deloff = function() M.set_deleted("off") end,
             delcursor = function() M.set_deleted("cursor") end,
             delall = function() M.set_deleted("all") end,
@@ -3314,7 +3500,7 @@ function M.setup(opts)
     end, {
         nargs = "?",
         complete = function()
-            return { "open", "actions", "diff", "help" }
+            return { "open", "actions", "diff", "layout", "help" }
         end,
     })
 
@@ -3330,6 +3516,9 @@ function M.setup(opts)
         map("n", "<leader>h?", M.help, { desc = "Redline: help" })
         if vim.fn.mapcheck((vim.g.mapleader or "\\") .. "hb", "n") == "" then
             map("n", "<leader>hb", M.back_to_review, { desc = "Redline: Back to changes" })
+        end
+        if vim.fn.mapcheck((vim.g.mapleader or "\\") .. "hs", "n") == "" then
+            map("n", "<leader>hs", M.toggle_layout, { desc = "Redline: side-by-side / unified diff" })
         end
         map("n", "]h", function() M.next_hunk(false) end, { desc = "Diff: next changed line" })
         map("n", "[h", function() M.next_hunk(true) end, { desc = "Diff: prev changed line" })

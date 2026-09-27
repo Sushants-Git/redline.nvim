@@ -214,7 +214,7 @@ function W.settings()
     local r = R()
     local items = {
         { "Choose review context", r.open }, { "Toggle overlay", r.toggle },
-        { "Toggle removed code", r.toggle_deleted }, { "Cycle comment bodies", r.cycle_comments },
+        { "Toggle removed code", r.toggle_deleted }, { "Toggle side-by-side diff", r.toggle_layout }, { "Cycle comment bodies", r.cycle_comments },
         { "Toggle GitHub comments", r.gh_toggle }, { "Sync GitHub comments", r.gh_sync },
     }
     vim.ui.select(items, { prompt = "Redline settings", format_item = function(i) return i[1] end }, function(i) if i then i[2]() end end)
@@ -278,6 +278,7 @@ function W.actions(first, last)
         end, true)
         add("h", "Select chunk at cursor (file)", function() r.select_hunk() end, true)
     end
+    add("t", "Toggle side-by-side / unified diff", function() r.toggle_layout() end)
     add("f", "Show changed files", function() r.overview(c.root) end)
     add("d", "Read changes (all files)", function() W.diff(c) end)
     add("n", "Read saved notes (all files)", function() r.open_notes(c.root) end)
@@ -323,6 +324,7 @@ function W.help()
     note("Undo reverses the last Redline action anywhere in this session.")
     section("Move")
     key("]h / [h", "Next / previous change")
+    key(leader .. "hs", "Side-by-side diff, or back to unified")
     key("f / d / n", "Files / Changes / Local notes from Actions")
     key("Enter / ?", "Open file / Help in review lists")
     key("/", "Search; Enter chooses an action")

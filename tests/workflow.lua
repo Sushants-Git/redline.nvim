@@ -39,7 +39,7 @@ local ok, err = xpcall(function()
     for _, key in ipairs({ "ho", "ha", "hc", "hv", "h?" }) do assert(vim.fn.maparg(" " .. key, "n") ~= "") end
     for _, key in ipairs({ "ha", "hc", "hv" }) do assert(vim.fn.maparg(" " .. key, "x") ~= "") end
     assert(vim.fn.maparg(" hh", "n") == "")
-    assert(vim.deep_equal(vim.fn.getcompletion("Redline ", "cmdline"), { "open", "actions", "diff", "help" }))
+    assert(vim.deep_equal(vim.fn.getcompletion("Redline ", "cmdline"), { "open", "actions", "diff", "layout", "help" }))
     local overview, old_overview = 0, r.overview
     r.overview = function() overview = overview + 1 end
     vim.ui.select = function(items, _, cb)

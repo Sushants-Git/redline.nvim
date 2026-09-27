@@ -67,7 +67,7 @@ local ok, err = xpcall(function()
         assert(entry.ordinal == item.label and entry.value == item)
         assert(maps["n" .. item.key] and not maps["i" .. item.key])
     end
-    equal(vim.tbl_count(keys), 14)
+    equal(vim.tbl_count(keys), 15)
     for key, name in pairs({ s = "stage", u = "unstage", c = "add_note", v = "toggle_viewed" }) do
         open(3, 2)
         vim.cmd.vsplit()
@@ -145,11 +145,11 @@ local ok, err = xpcall(function()
     api.nvim_buf_set_lines(buf, 0, -1, false, { "one", "two", "three", "four" })
     c.github = false
     open()
-    assert(#opts.finder.results == 13 and not maps.np)
+    assert(#opts.finder.results == 14 and not maps.np)
     c.github = true
     vim.bo[buf].buftype = "nofile"
     open()
-    assert(#opts.finder.results == 7 and not maps.ns and not maps.ny and not maps.na)
+    assert(#opts.finder.results == 8 and not maps.ns and not maps.ny and not maps.na)
     assert(opts.prompt_title == "Redline | Project: " .. root)
     vim.bo[buf].buftype = ""
 
@@ -159,7 +159,7 @@ local ok, err = xpcall(function()
     local fallback_calls = 0
     vim.ui.select = function(items, options, callback)
         fallback_calls = fallback_calls + 1
-        assert(#items == 14 and options.prompt:find("Lines 2-3", 1, true))
+        assert(#items == 15 and options.prompt:find("Lines 2-3", 1, true))
         assert(options.format_item(items[1]) == "[s] Stage selected lines 2-3")
         callback(items[1])
     end
